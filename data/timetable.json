@@ -1,0 +1,31 @@
+{
+  "source": "Hararaya University, College of Computing and Informatics, Department of Information Systems, updated 2nd Year Semester I Class Schedule, 2026/27 academic year, dated October 25, 2026.",
+  "source_timezone": "Displayed East Africa time converted to Ethiopian local clock by subtracting six hours",
+  "local_timezone": "Africa/Addis_Ababa",
+  "classes": [
+    {"id":"gtlir2013-A-tue","course":"Global Trends and International Relations (Gtlr2013)","course_type":"other","section":"A","day":"Tuesday","start":"07:30","end":"09:30"},
+    {"id":"gtlir2013-B-wed","course":"Global Trends and International Relations (Gtlr2013)","course_type":"other","section":"B","day":"Wednesday","start":"09:30","end":"11:30"},
+    {"id":"inc12011-A-mon","course":"Inclusiveness (Inc12011)","course_type":"other","section":"A","day":"Monday","start":"07:30","end":"09:30"},
+    {"id":"inc12011-B-tue","course":"Inclusiveness (Inc12011)","course_type":"other","section":"B","day":"Tuesday","start":"02:30","end":"04:30"},
+    {"id":"insy2021-A-wed","course":"Introduction to Information Systems and Society (InSy2021)","course_type":"other","section":"A","day":"Wednesday","start":"07:30","end":"09:30"},
+    {"id":"insy2021-A-thu","course":"Introduction to Information Systems and Society (InSy2021)","course_type":"other","section":"A","day":"Thursday","start":"02:30","end":"04:30"},
+    {"id":"insy2021-B-fri","course":"Introduction to Information Systems and Society (InSy2021)","course_type":"other","section":"B","day":"Friday","start":"02:30","end":"04:30"},
+    {"id":"insy2021-B-mon","course":"Introduction to Information Systems and Society (InSy2021)","course_type":"other","section":"B","day":"Monday","start":"02:30","end":"04:30"},
+    {"id":"insy2061-A-mon","course":"System Analysis and Design (InSy2061)","course_type":"system_analysis_design","section":"A","day":"Monday","start":"02:30","end":"04:30"},
+    {"id":"insy2061-A-fri","course":"System Analysis and Design (InSy2061)","course_type":"system_analysis_design","section":"A","day":"Friday","start":"02:30","end":"04:30"},
+    {"id":"insy2061-B-tue","course":"System Analysis and Design (InSy2061)","course_type":"system_analysis_design","section":"B","day":"Tuesday","start":"04:30","end":"06:30"},
+    {"id":"insy2061-B-thu","course":"System Analysis and Design (InSy2061)","course_type":"system_analysis_design","section":"B","day":"Thursday","start":"07:30","end":"09:30"},
+    {"id":"mgmt2025-A-thu","course":"Introduction to Management (MgMt2025)","course_type":"other","section":"A","day":"Thursday","start":"07:30","end":"09:30"},
+    {"id":"mgmt2025-A-wed","course":"Introduction to Management (MgMt2025)","course_type":"other","section":"A","day":"Wednesday","start":"04:30","end":"05:30"},
+    {"id":"mgmt2025-B-wed","course":"Introduction to Management (MgMt2025)","course_type":"other","section":"B","day":"Wednesday","start":"07:30","end":"09:30"},
+    {"id":"mgmt2025-B-mon","course":"Introduction to Management (MgMt2025)","course_type":"other","section":"B","day":"Monday","start":"04:30","end":"05:30"},
+    {"id":"insy2031-A-tue","course":"Basic Computer Programming II (InSy2031)","course_type":"other","section":"A","day":"Tuesday","start":"02:30","end":"05:30"},
+    {"id":"insy2031-A-wed","course":"Basic Computer Programming II (InSy2031)","course_type":"other","section":"A","day":"Wednesday","start":"02:30","end":"04:30"},
+    {"id":"insy2031-B-mon","course":"Basic Computer Programming II (InSy2031)","course_type":"other","section":"B","day":"Monday","start":"07:30","end":"10:30"},
+    {"id":"insy2031-B-tue","course":"Basic Computer Programming II (InSy2031)","course_type":"other","section":"B","day":"Tuesday","start":"07:30","end":"09:30"},
+    {"id":"math2031-A-thu","course":"Discrete Mathematics and Combinatory (Math2031)","course_type":"other","section":"A","day":"Thursday","start":"04:30","end":"07:30"},
+    {"id":"math2031-A-fri","course":"Discrete Mathematics and Combinatory (Math2031)","course_type":"other","section":"A","day":"Friday","start":"07:30","end":"09:30"},
+    {"id":"math2031-B-thu","course":"Discrete Mathematics and Combinatory (Math2031)","course_type":"other","section":"B","day":"Thursday","start":"02:30","end":"04:30"},
+    {"id":"math2031-B-wed","course":"Discrete Mathematics and Combinatory (Math2031)","course_type":"other","section":"B","day":"Wednesday","start":"05:30","end":"06:30"}
+  ]
+}
