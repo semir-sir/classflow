@@ -40,7 +40,7 @@ The starting balance is 64 hours per section, inserted only on first database in
 4. Copy `.env.example` to `.env`: `Copy-Item .env.example .env`.
 5. Set `BOT_TOKEN` to a newly generated token in `.env`. Do not share the token in chat or commit `.env`.
 6. Set `TEACHER_TELEGRAM_ID` to the teacher's personal numeric Telegram user ID, and set `TELEGRAM_GROUP_ID_A` and `TELEGRAM_GROUP_ID_B` to the respective groups' numeric chat IDs. Add the bot to both groups and allow it to post messages.
-7. From the project folder, run `.venv\\Scripts\\python.exe app.py` (or `py app.py` if your `py` launcher is configured).
+7. From the project folder, run `.venv\\Scripts\\python.exe bot.py` (Pterodactyl/Linux: `python bot.py`). `app.py` is also a supported entry point. Both initialize a main-thread asyncio loop before starting PTB polling.
 8. Run the test suite with `.venv\\Scripts\\python.exe -m unittest discover -s tests -v`.
 
 In Telegram, send `/start` to the bot.

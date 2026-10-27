@@ -691,23 +691,48 @@ async def stop_makeup_reminder_task(application: Application):
         await asyncio.gather(task, return_exceptions=True)
 
 def main():
-    init_db()
-    app = (
-        Application.builder()
-        .token(BOT_TOKEN)
-        .post_init(start_makeup_reminder_task)
-        .post_shutdown(stop_makeup_reminder_task)
-        .build()
-    )
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("cancel", cancel))
-    app.add_handler(CommandHandler("makeups", makeups_command))
-    app.add_handler(CommandHandler("myid", my_id))
-    app.add_handler(CommandHandler("groupid", group_id))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, plan_makeup_text))
-    app.add_handler(CallbackQueryHandler(callback))
-    print("ClassFlow Confirm Regular Class module is running.")
-    app.run_polling()
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        pass
+    else:
+        raise RuntimeError(
+            "ClassFlow must be started as a standalone process; do not call main() inside asyncio.run() or another running event loop."
+        )
+
+    # Python 3.12+ may start the main thread without a current event loop.
+    # PTB's synchronous run_polling() needs one registered before Application setup.
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        init_db()
+        app = (
+            Application.builder()
+            .token(BOT_TOKEN)
+            .post_init(start_makeup_reminder_task)
+            .post_shutdown(stop_makeup_reminder_task)
+            .build()
+        )
+        app.add_handler(CommandHandler("start", start))
+        app.add_handler(CommandHandler("cancel", cancel))
+        app.add_handler(CommandHandler("makeups", makeups_command))
+        app.add_handler(CommandHandler("myid", my_id))
+        app.add_handler(CommandHandler("groupid", group_id))
+        app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, plan_makeup_text))
+        app.add_handler(CallbackQueryHandler(callback))
+        print("ClassFlow Confirm Regular Class module is running.", flush=True)
+        app.run_polling(close_loop=True)
+    finally:
+        # PTB normally closes the loop; clean it up too if startup exits early.
+        if not loop.is_closed():
+            pending = asyncio.all_tasks(loop)
+            for task in pending:
+                task.cancel()
+            if pending:
+                loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+            loop.run_until_complete(loop.shutdown_asyncgens())
+            loop.close()
+        asyncio.set_event_loop(None)
 
 if __name__ == "__main__":
     main()
