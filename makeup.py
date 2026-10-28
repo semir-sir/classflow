@@ -20,13 +20,13 @@ def format_makeup_reminder(obligation):
     sections = ", ".join(obligation["sections"].split(","))
     duration_hours = obligation["duration_minutes"] / 60
     return (
-        "Makeup class reminder: a cancelled class needs a makeup plan.\n"
-        f"Course: {obligation['course']}\n"
-        f"Section(s): {sections}\n"
-        f"Original class date: {obligation['original_date']}\n"
-        f"Time: {obligation['start']}–{obligation['end']}\n"
-        f"Duration: {duration_hours:g} hour(s)\n\n"
-        "Use /makeups to plan or update its status."
+        "🔔 Makeup class reminder: a cancelled class needs a makeup plan.\n"
+        f"📘 Course: {obligation['course']}\n"
+        f"👥 Section(s): {sections}\n"
+        f"🗓️ Original class date: {obligation['original_date']}\n"
+        f"🕒 Time: {obligation['start']}–{obligation['end']}\n"
+        f"⏱️ Duration: {duration_hours:g} hour(s)\n\n"
+        "📝 Use /makeups to plan or update its status."
     )
 
 
@@ -84,11 +84,11 @@ async def _send_group_notice(bot, notice, section_group_ids, timezone):
         )
         return notice["section"]
     text = (
-        f"Class cancelled: {notice['course']}\n"
-        f"Section: {notice['section']}\n"
-        f"Original date: {notice['original_date']}\n"
-        f"Time: {notice['start']}–{notice['end']}\n"
-        f"Duration: {notice['duration_minutes'] / 60:g} hour(s)"
+        f"❌ Class cancelled: {notice['course']}\n"
+        f"👥 Section: {notice['section']}\n"
+        f"🗓️ Original date: {notice['original_date']}\n"
+        f"🕒 Time: {notice['start']}–{notice['end']}\n"
+        f"⏱️ Duration: {notice['duration_minutes'] / 60:g} hour(s)"
     )
     try:
         await bot.send_message(chat_id=chat_id, text=text)
@@ -128,10 +128,10 @@ async def broadcast_scheduled_makeup(bot, teacher_id, section_group_ids, student
     end_minutes = planned.hour * 60 + planned.minute + duration
     end_time = f"{end_minutes // 60:02d}:{end_minutes % 60:02d}"
     text = (
-        f"Makeup class scheduled\nCourse: {obligation['course']}\nSection(s): {obligation['sections']}\n"
-        f"Date: {planned.date().isoformat()} · {planned:%H:%M}–{end_time}\n"
-        f"Duration: {duration / 60:g} hour(s)\n"
-        "Credit hour deducted successfully."
+        f"✅ Makeup class scheduled\n📘 Course: {obligation['course']}\n👥 Section(s): {obligation['sections']}\n"
+        f"🗓️ Date: {planned.date().isoformat()} · {planned:%H:%M}–{end_time}\n"
+        f"⏱️ Duration: {duration / 60:g} hour(s)\n"
+        "💳 Credit hour deducted successfully."
     )
     recipients = ([student_group_id] if student_group_id is not None else
                   [section_group_ids[section] for section in obligation["sections"].split(",")
