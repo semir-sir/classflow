@@ -1,6 +1,7 @@
 import asyncio
 import tempfile
 import unittest
+import zipfile
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -45,6 +46,34 @@ def make_text_pdf(path):
     writer.add_metadata({"/Title": "Information Systems"})
     with Path(path).open("wb") as output:
         writer.write(output)
+
+
+def make_text_pptx(path):
+    namespaces = {
+        "p": "http://schemas.openxmlformats.org/presentationml/2006/main",
+        "a": "http://schemas.openxmlformats.org/drawingml/2006/main",
+        "r": "http://schemas.openxmlformats.org/officeDocument/2006/relationships",
+        "rel": "http://schemas.openxmlformats.org/package/2006/relationships",
+        "dc": "http://purl.org/dc/elements/1.1/",
+        "cp": "http://schemas.openxmlformats.org/package/2006/metadata/core-properties",
+    }
+    def para(text, size="2400"):
+        return f'<a:p><a:r><a:rPr sz="{size}" b="1"/><a:t>{text}</a:t></a:r></a:p>'
+
+    slide = (
+        f'<p:sld xmlns:p="{namespaces["p"]}" xmlns:a="{namespaces["a"]}">'
+        '<p:cSld><p:spTree>'
+        '<p:sp><p:nvSpPr><p:cNvPr id="2" name="Title"/><p:cNvSpPr/>'
+        f'<p:nvPr><p:ph type="title"/></p:nvPr></p:nvSpPr><p:spPr/><p:txBody><a:bodyPr/><a:lstStyle/>{para("Foundations")}</p:txBody></p:sp>'
+        '<p:sp><p:nvSpPr><p:cNvPr id="3" name="Content"/><p:cNvSpPr/><p:nvPr/></p:nvSpPr><p:spPr/><p:txBody><a:bodyPr/><a:lstStyle/>'
+        f'{para("Chapter 1: Introduction")}{para("1.1 Core concepts")}{para("1.1.1 Key terms")}'
+        '</p:txBody></p:sp></p:spTree></p:cSld></p:sld>'
+    )
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("ppt/presentation.xml", f'<p:presentation xmlns:p="{namespaces["p"]}" xmlns:r="{namespaces["r"]}"><p:sldIdLst><p:sldId id="256" r:id="rId1"/></p:sldIdLst></p:presentation>')
+        archive.writestr("ppt/_rels/presentation.xml.rels", f'<Relationships xmlns="{namespaces["rel"]}"><Relationship Id="rId1" Type="slide" Target="slides/slide1.xml"/></Relationships>')
+        archive.writestr("ppt/slides/slide1.xml", slide)
+        archive.writestr("docProps/core.xml", f'<cp:coreProperties xmlns:cp="{namespaces["cp"]}" xmlns:dc="{namespaces["dc"]}"><dc:title>Systems Analysis and Design</dc:title></cp:coreProperties>')
 
 
 def make_outline():
@@ -134,6 +163,21 @@ class LessonPrepTests(unittest.TestCase):
             self.assertEqual(docx_outline["chapters"][0]["topics"][0]["title"], "1.1 Core concepts")
             self.assertEqual(docx_outline["chapters"][0]["topics"][0]["children"][0]["title"], "1.1.1 Key terms")
             self.assertNotIn("explanatory paragraph", str(docx_outline))
+
+    def test_pptx_title_slide_and_topic_extraction(self):
+        with tempfile.TemporaryDirectory() as directory:
+            pptx_path = Path(directory) / "course.pptx"
+            make_text_pptx(pptx_path)
+            outline = extract_syllabus(pptx_path, ".pptx")
+            self.assertEqual(outline["course_title"], "Systems Analysis and Design")
+            self.assertEqual(outline["chapters"][0]["title"], "Chapter 1: Introduction")
+            core_concepts = next(topic for topic in outline["chapters"][0]["topics"] if topic["title"] == "1.1 Core concepts")
+            self.assertEqual(core_concepts["children"][0]["title"], "1.1.1 Key terms")
+
+            malformed = Path(directory) / "broken.pptx"
+            malformed.write_bytes(b"not a PowerPoint package")
+            with self.assertRaisesRegex(SyllabusDocumentError, "couldn't read this PowerPoint"):
+                extract_syllabus(malformed, ".pptx")
 
     def test_scanned_empty_and_malformed_pdf_are_reported(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -365,7 +409,7 @@ class LessonPrepTests(unittest.TestCase):
             effective_chat=SimpleNamespace(type="private"),
         )
         asyncio.run(handle_document_upload(update, SimpleNamespace(user_data={}), TEACHER_ID, TIMEZONE, 10_000))
-        self.assertIn("PDF and DOCX", message.replies[0])
+        self.assertIn("PDF, DOCX, and PPTX", message.replies[0])
         unauthorized = SimpleNamespace(
             effective_message=Message(Document()), effective_user=SimpleNamespace(id=TEACHER_ID + 1),
             effective_chat=SimpleNamespace(type="private"),
@@ -408,6 +452,20 @@ class LessonPrepTests(unittest.TestCase):
         self.assertIsNotNone(pending)
         self.assertEqual(len(downloaded_paths), 1)
         self.assertFalse(downloaded_paths[0].exists())
+
+        powerpoint = DocumentStub()
+        powerpoint.file_name = "slides.pptx"
+        powerpoint.mime_type = "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+        ppt_message = Message(powerpoint)
+        ppt_update = SimpleNamespace(
+            effective_message=ppt_message, effective_user=SimpleNamespace(id=TEACHER_ID),
+            effective_chat=SimpleNamespace(type="private"),
+        )
+        with patch("lesson_tracker.extract_syllabus", return_value=make_outline()) as extract_mock:
+            asyncio.run(handle_document_upload(ppt_update, SimpleNamespace(user_data={}), TEACHER_ID, TIMEZONE, 100))
+        self.assertEqual(extract_mock.call_args.args[1], ".pptx")
+        self.assertFalse(downloaded_paths[-1].exists())
+        self.assertFalse(any("does not match" in reply for reply in ppt_message.replies))
 
         oversized = DocumentStub()
         oversized.file_size = 101

@@ -25,6 +25,10 @@ UPLOAD_MIME_TYPES = {
         "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
         "application/octet-stream",
     },
+    ".pptx": {
+        "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        "application/octet-stream",
+    },
 }
 REVIEW_PAGE_SIZE = 8
 TOPIC_PAGE_SIZE = 8
@@ -153,11 +157,11 @@ async def handle_document_upload(update, context, teacher_id, timezone, max_uplo
         filename = "uploaded-syllabus"
     suffix = Path(filename).suffix.lower()
     if suffix not in UPLOAD_MIME_TYPES:
-        await message.reply_text("📎 I can read text-based PDF and DOCX files. Please upload one of those formats.")
+        await message.reply_text("📎 I can read text-based PDF, DOCX, and PPTX files. Please upload one of those formats.")
         return
     mime_type = (document.mime_type or "").split(";", 1)[0].strip().lower()
     if mime_type and mime_type not in UPLOAD_MIME_TYPES[suffix]:
-        await message.reply_text("⚠️ The file type does not match its extension. Please upload a valid PDF or DOCX.")
+        await message.reply_text("⚠️ The file type does not match its extension. Please upload a valid PDF, DOCX, or PPTX.")
         return
     if document.file_size is not None and document.file_size > max_upload_bytes:
         await message.reply_text(f"⚠️ This file is larger than the {max_upload_bytes // (1024 * 1024)} MB upload limit.")
@@ -318,7 +322,7 @@ def _syllabus_choices(confirmation_id, teacher_id, page):
     lines = ["📚 Choose the syllabus for this class:"]
     rows = []
     if not all_items:
-        lines.append("No active syllabuses yet. Upload a PDF or DOCX in this private chat first.")
+        lines.append("No active syllabuses yet. Upload a PDF, DOCX, or PPTX in this private chat first.")
     for item in items:
         rows.append([InlineKeyboardButton(
             f"📘 { _short(item['title'], 38) } · {item['topic_count']} topics",
@@ -491,7 +495,7 @@ def _syllabus_library(teacher_id, page):
     lines = ["📚 Syllabus Library", "Choose a syllabus to see unique-topic progress.", ""]
     rows = []
     if not items:
-        lines.append("No syllabuses have been confirmed yet. Upload a PDF or DOCX in this private chat.")
+        lines.append("No syllabuses have been confirmed yet. Upload a PDF, DOCX, or PPTX in this private chat.")
     for item in visible:
         rows.append([InlineKeyboardButton(
             f"📘 {_short(item['title'], 38)} · {item['topic_count']} topics",
