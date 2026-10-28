@@ -1,4 +1,5 @@
 import sqlite3
+import json
 from datetime import date, datetime, timedelta
 from contextlib import contextmanager
 from pathlib import Path
@@ -158,6 +159,72 @@ def init_db(initial_balances=None):
                 "INSERT OR IGNORE INTO balances(section, hours_remaining) VALUES (?, ?)",
                 (section, float(hours))
             )
+        # Additive lesson-preparation schema. Existing class and credit tables are
+        # intentionally left intact; pending imports are separate from active data.
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS syllabus_imports (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                teacher_id INTEGER NOT NULL,
+                filename TEXT NOT NULL,
+                content_sha256 TEXT NOT NULL,
+                course_title TEXT NOT NULL DEFAULT '',
+                outline_json TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                UNIQUE(teacher_id, content_sha256)
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS syllabuses (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                teacher_id INTEGER NOT NULL,
+                title TEXT NOT NULL,
+                source_filename TEXT NOT NULL,
+                content_sha256 TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                UNIQUE(teacher_id, content_sha256)
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS syllabus_chapters (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                syllabus_id INTEGER NOT NULL REFERENCES syllabuses(id) ON DELETE CASCADE,
+                position INTEGER NOT NULL,
+                title TEXT NOT NULL
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS syllabus_topics (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chapter_id INTEGER NOT NULL REFERENCES syllabus_chapters(id) ON DELETE CASCADE,
+                parent_topic_id INTEGER REFERENCES syllabus_topics(id) ON DELETE CASCADE,
+                position INTEGER NOT NULL,
+                title TEXT NOT NULL
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS class_syllabuses (
+                confirmation_id INTEGER NOT NULL REFERENCES confirmations(id) ON DELETE CASCADE,
+                syllabus_id INTEGER NOT NULL REFERENCES syllabuses(id) ON DELETE CASCADE,
+                teacher_id INTEGER NOT NULL,
+                linked_at TEXT NOT NULL,
+                PRIMARY KEY(confirmation_id, syllabus_id)
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS class_topic_assignments (
+                confirmation_id INTEGER NOT NULL REFERENCES confirmations(id) ON DELETE CASCADE,
+                topic_id INTEGER NOT NULL REFERENCES syllabus_topics(id) ON DELETE CASCADE,
+                status TEXT NOT NULL DEFAULT 'Planned'
+                    CHECK(status IN ('Planned', 'Partially covered', 'Completed', 'Not covered')),
+                note TEXT NOT NULL DEFAULT '',
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY(confirmation_id, topic_id)
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_syllabuses_teacher ON syllabuses(teacher_id, title)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_syllabus_topics_chapter ON syllabus_topics(chapter_id, parent_topic_id, position)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_class_topic_status ON class_topic_assignments(topic_id, status)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_class_syllabuses_teacher ON class_syllabuses(teacher_id, confirmation_id)")
 
 def get_balances():
     with connect() as conn:
@@ -583,3 +650,529 @@ def list_pending_group_notifications():
             ORDER BY n.id
         """).fetchall()
     return [dict(row) for row in rows]
+
+
+def _lesson_teacher_id(teacher_id):
+    try:
+        value = int(teacher_id)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("A valid authorized teacher ID is required.") from exc
+    if value <= 0:
+        raise ValueError("A valid authorized teacher ID is required.")
+    return value
+
+
+def _pending_syllabus_row(row):
+    if not row:
+        return None
+    item = dict(row)
+    item["outline"] = json.loads(item.pop("outline_json"))
+    return item
+
+
+def create_pending_syllabus_import(teacher_id, filename, content_sha256, outline, created_at):
+    """Stage a teacher-reviewed import; no active syllabus is created here."""
+    teacher_id = _lesson_teacher_id(teacher_id)
+    serialized = json.dumps(outline, ensure_ascii=False, separators=(",", ":"))
+    if len(serialized) > 500_000:
+        raise ValueError("The extracted outline is too large to review safely.")
+    with connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        active = conn.execute(
+            "SELECT id, title FROM syllabuses WHERE teacher_id = ? AND content_sha256 = ?",
+            (teacher_id, content_sha256),
+        ).fetchone()
+        if active:
+            return {"status": "already_imported", "syllabus": dict(active)}
+        pending = conn.execute(
+            "SELECT * FROM syllabus_imports WHERE teacher_id = ? AND content_sha256 = ?",
+            (teacher_id, content_sha256),
+        ).fetchone()
+        if pending:
+            return {"status": "already_pending", "import": _pending_syllabus_row(pending)}
+        cursor = conn.execute("""
+            INSERT INTO syllabus_imports
+                (teacher_id, filename, content_sha256, course_title, outline_json, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+        """, (teacher_id, filename, content_sha256,
+              str(outline.get("course_title", "")).strip(), serialized, created_at))
+        row = conn.execute(
+            "SELECT * FROM syllabus_imports WHERE id = ?", (cursor.lastrowid,)
+        ).fetchone()
+    return {"status": "created", "import": _pending_syllabus_row(row)}
+
+
+def get_pending_syllabus_import(import_id, teacher_id):
+    teacher_id = _lesson_teacher_id(teacher_id)
+    with connect() as conn:
+        row = conn.execute(
+            "SELECT * FROM syllabus_imports WHERE id = ? AND teacher_id = ?",
+            (int(import_id), teacher_id),
+        ).fetchone()
+    return _pending_syllabus_row(row)
+
+
+def update_pending_syllabus_import(import_id, teacher_id, outline):
+    teacher_id = _lesson_teacher_id(teacher_id)
+    serialized = json.dumps(outline, ensure_ascii=False, separators=(",", ":"))
+    if len(serialized) > 500_000:
+        raise ValueError("The edited outline is too large to store safely.")
+    with connect() as conn:
+        cursor = conn.execute("""
+            UPDATE syllabus_imports
+            SET course_title = ?, outline_json = ?
+            WHERE id = ? AND teacher_id = ?
+        """, (str(outline.get("course_title", "")).strip(), serialized,
+              int(import_id), teacher_id))
+        if cursor.rowcount != 1:
+            return None
+        row = conn.execute(
+            "SELECT * FROM syllabus_imports WHERE id = ?", (int(import_id),)
+        ).fetchone()
+    return _pending_syllabus_row(row)
+
+
+def cancel_pending_syllabus_import(import_id, teacher_id):
+    teacher_id = _lesson_teacher_id(teacher_id)
+    with connect() as conn:
+        cursor = conn.execute(
+            "DELETE FROM syllabus_imports WHERE id = ? AND teacher_id = ?",
+            (int(import_id), teacher_id),
+        )
+    return cursor.rowcount == 1
+
+
+def confirm_syllabus_import(import_id, teacher_id, created_at):
+    """Atomically activate a reviewed outline and remove its staging row."""
+    teacher_id = _lesson_teacher_id(teacher_id)
+    with connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        staged = conn.execute(
+            "SELECT * FROM syllabus_imports WHERE id = ? AND teacher_id = ?",
+            (int(import_id), teacher_id),
+        ).fetchone()
+        if not staged:
+            raise ValueError("This syllabus review has expired. Upload the document again.")
+        existing = conn.execute(
+            "SELECT id FROM syllabuses WHERE teacher_id = ? AND content_sha256 = ?",
+            (teacher_id, staged["content_sha256"]),
+        ).fetchone()
+        if existing:
+            raise ValueError("This syllabus has already been imported.")
+        outline = json.loads(staged["outline_json"])
+        title = str(staged["course_title"] or outline.get("course_title") or "").strip()
+        chapters = outline.get("chapters")
+        if not title:
+            raise ValueError("Add a course or syllabus title before confirming the import.")
+        if not isinstance(chapters, list) or not chapters:
+            raise ValueError("Add at least one chapter before confirming the import.")
+        cursor = conn.execute("""
+            INSERT INTO syllabuses
+                (teacher_id, title, source_filename, content_sha256, created_at)
+            VALUES (?, ?, ?, ?, ?)
+        """, (teacher_id, title, staged["filename"], staged["content_sha256"], created_at))
+        syllabus_id = cursor.lastrowid
+
+        def insert_topics(chapter_id, parent_id, topics):
+            if not isinstance(topics, list):
+                raise ValueError("The reviewed outline has an invalid topic list.")
+            for position, topic in enumerate(topics):
+                if not isinstance(topic, dict):
+                    raise ValueError("The reviewed outline contains an invalid topic.")
+                topic_title = str(topic.get("title", "")).strip()
+                if not topic_title:
+                    raise ValueError("Every topic needs a title before confirming the import.")
+                topic_cursor = conn.execute("""
+                    INSERT INTO syllabus_topics (chapter_id, parent_topic_id, position, title)
+                    VALUES (?, ?, ?, ?)
+                """, (chapter_id, parent_id, position, topic_title))
+                insert_topics(chapter_id, topic_cursor.lastrowid, topic.get("children", []))
+
+        for position, chapter in enumerate(chapters):
+            if not isinstance(chapter, dict) or not str(chapter.get("title", "")).strip():
+                raise ValueError("Every chapter needs a title before confirming the import.")
+            chapter_cursor = conn.execute("""
+                INSERT INTO syllabus_chapters (syllabus_id, position, title)
+                VALUES (?, ?, ?)
+            """, (syllabus_id, position, str(chapter["title"]).strip()))
+            insert_topics(chapter_cursor.lastrowid, None, chapter.get("topics", []))
+        conn.execute("DELETE FROM syllabus_imports WHERE id = ?", (int(import_id),))
+        syllabus = conn.execute("SELECT * FROM syllabuses WHERE id = ?", (syllabus_id,)).fetchone()
+    return dict(syllabus)
+
+
+def list_syllabuses(teacher_id):
+    teacher_id = _lesson_teacher_id(teacher_id)
+    with connect() as conn:
+        rows = conn.execute("""
+            SELECT s.*, COUNT(t.id) AS topic_count
+            FROM syllabuses s
+            LEFT JOIN syllabus_chapters c ON c.syllabus_id = s.id
+            LEFT JOIN syllabus_topics t ON t.chapter_id = c.id
+            WHERE s.teacher_id = ?
+            GROUP BY s.id
+            ORDER BY s.title COLLATE NOCASE, s.id
+        """, (teacher_id,)).fetchall()
+    return [dict(row) for row in rows]
+
+
+def get_syllabus(syllabus_id, teacher_id):
+    teacher_id = _lesson_teacher_id(teacher_id)
+    with connect() as conn:
+        row = conn.execute("""
+            SELECT s.*, COUNT(t.id) AS topic_count
+            FROM syllabuses s
+            LEFT JOIN syllabus_chapters c ON c.syllabus_id = s.id
+            LEFT JOIN syllabus_topics t ON t.chapter_id = c.id
+            WHERE s.id = ? AND s.teacher_id = ?
+            GROUP BY s.id
+        """, (int(syllabus_id), teacher_id)).fetchone()
+    return dict(row) if row else None
+
+
+def get_teacher_lessons(teacher_id, today, offset=0, limit=8):
+    """Return all active confirmed classes available to the configured teacher."""
+    _lesson_teacher_id(teacher_id)
+    offset, limit = max(0, int(offset)), min(20, max(1, int(limit)))
+    with connect() as conn:
+        rows = conn.execute("""
+            SELECT c.*,
+                (SELECT COUNT(*) FROM class_syllabuses cs
+                 WHERE cs.confirmation_id = c.id AND cs.teacher_id = ?) AS syllabus_count,
+                (SELECT COUNT(*) FROM class_topic_assignments a
+                 WHERE a.confirmation_id = c.id) AS planned_topic_count
+            FROM confirmations c
+            WHERE NOT EXISTS (
+                  SELECT 1 FROM makeup_obligations m
+                  WHERE m.session_id = c.session_id AND m.original_date = c.class_date
+              )
+            ORDER BY CASE WHEN c.class_date >= ? THEN 0 ELSE 1 END,
+                     CASE WHEN c.class_date >= ? THEN c.class_date END ASC,
+                     CASE WHEN c.class_date < ? THEN c.class_date END DESC,
+                     c.start, c.id
+            LIMIT ? OFFSET ?
+        """, (int(teacher_id), today, today, today, limit, offset)).fetchall()
+    return [dict(row) for row in rows]
+
+
+def get_lesson_class(confirmation_id, teacher_id):
+    _lesson_teacher_id(teacher_id)
+    with connect() as conn:
+        row = conn.execute("""
+            SELECT c.* FROM confirmations c
+            WHERE c.id = ? AND NOT EXISTS (
+                SELECT 1 FROM makeup_obligations m
+                WHERE m.session_id = c.session_id AND m.original_date = c.class_date
+            )
+        """, (int(confirmation_id),)).fetchone()
+    return dict(row) if row else None
+
+
+def get_class_syllabuses(confirmation_id, teacher_id):
+    teacher_id = _lesson_teacher_id(teacher_id)
+    with connect() as conn:
+        rows = conn.execute("""
+            SELECT s.id, s.title, COUNT(t.id) AS topic_count
+            FROM class_syllabuses cs
+            JOIN confirmations active_class ON active_class.id = cs.confirmation_id
+            JOIN syllabuses s ON s.id = cs.syllabus_id AND s.teacher_id = cs.teacher_id
+            LEFT JOIN syllabus_chapters c ON c.syllabus_id = s.id
+            LEFT JOIN syllabus_topics t ON t.chapter_id = c.id
+            WHERE cs.confirmation_id = ? AND cs.teacher_id = ?
+              AND NOT EXISTS (
+                  SELECT 1 FROM makeup_obligations m
+                  WHERE m.session_id = active_class.session_id AND m.original_date = active_class.class_date
+              )
+            GROUP BY s.id
+            ORDER BY s.title COLLATE NOCASE, s.id
+        """, (int(confirmation_id), teacher_id)).fetchall()
+    return [dict(row) for row in rows]
+
+
+def link_syllabus_to_class(confirmation_id, syllabus_id, teacher_id, linked_at):
+    teacher_id = _lesson_teacher_id(teacher_id)
+    with connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        class_row = conn.execute("""
+            SELECT c.id FROM confirmations c
+            WHERE c.id = ? AND NOT EXISTS (
+                SELECT 1 FROM makeup_obligations m
+                WHERE m.session_id = c.session_id AND m.original_date = c.class_date
+            )
+        """, (int(confirmation_id),)
+        ).fetchone()
+        syllabus = conn.execute(
+            "SELECT id FROM syllabuses WHERE id = ? AND teacher_id = ?",
+            (int(syllabus_id), teacher_id),
+        ).fetchone()
+        if not class_row or not syllabus:
+            return False
+        conn.execute("""
+            INSERT OR IGNORE INTO class_syllabuses
+                (confirmation_id, syllabus_id, teacher_id, linked_at)
+            VALUES (?, ?, ?, ?)
+        """, (int(confirmation_id), int(syllabus_id), teacher_id, linked_at))
+    return True
+
+
+def get_syllabus_chapters(syllabus_id, teacher_id):
+    syllabus = get_syllabus(syllabus_id, teacher_id)
+    if not syllabus:
+        return []
+    with connect() as conn:
+        rows = conn.execute("""
+            SELECT id, syllabus_id, position, title
+            FROM syllabus_chapters WHERE syllabus_id = ? ORDER BY position, id
+        """, (int(syllabus_id),)).fetchall()
+    return [dict(row) for row in rows]
+
+
+def get_class_syllabus_topics(confirmation_id, syllabus_id, teacher_id):
+    teacher_id = _lesson_teacher_id(teacher_id)
+    with connect() as conn:
+        allowed = conn.execute("""
+            SELECT 1 FROM class_syllabuses cs
+            JOIN confirmations active_class ON active_class.id = cs.confirmation_id
+            JOIN syllabuses s ON s.id = cs.syllabus_id AND s.teacher_id = cs.teacher_id
+            WHERE cs.confirmation_id = ? AND cs.syllabus_id = ? AND cs.teacher_id = ?
+              AND NOT EXISTS (
+                  SELECT 1 FROM makeup_obligations m
+                  WHERE m.session_id = active_class.session_id AND m.original_date = active_class.class_date
+              )
+        """, (int(confirmation_id), int(syllabus_id), teacher_id)).fetchone()
+        if not allowed:
+            return []
+        rows = conn.execute("""
+            SELECT t.id, t.chapter_id, t.parent_topic_id, t.position, t.title,
+                   c.title AS chapter_title, a.status, a.note
+            FROM syllabus_topics t
+            JOIN syllabus_chapters c ON c.id = t.chapter_id
+            LEFT JOIN class_topic_assignments a
+              ON a.topic_id = t.id AND a.confirmation_id = ?
+            WHERE c.syllabus_id = ?
+            ORDER BY c.position, t.parent_topic_id IS NOT NULL, t.parent_topic_id, t.position, t.id
+        """, (int(confirmation_id), int(syllabus_id))).fetchall()
+    return [dict(row) for row in rows]
+
+
+def toggle_class_topic(confirmation_id, syllabus_id, topic_id, teacher_id, updated_at):
+    teacher_id = _lesson_teacher_id(teacher_id)
+    with connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        valid = conn.execute("""
+            SELECT 1 FROM class_syllabuses cs
+            JOIN confirmations active_class ON active_class.id = cs.confirmation_id
+            JOIN syllabus_chapters c ON c.syllabus_id = cs.syllabus_id
+            JOIN syllabus_topics t ON t.chapter_id = c.id
+            WHERE cs.confirmation_id = ? AND cs.syllabus_id = ? AND cs.teacher_id = ? AND t.id = ?
+              AND NOT EXISTS (
+                  SELECT 1 FROM makeup_obligations m
+                  WHERE m.session_id = active_class.session_id AND m.original_date = active_class.class_date
+              )
+        """, (int(confirmation_id), int(syllabus_id), teacher_id, int(topic_id))).fetchone()
+        if not valid:
+            return False
+        existing = conn.execute("""
+            SELECT 1 FROM class_topic_assignments
+            WHERE confirmation_id = ? AND topic_id = ?
+        """, (int(confirmation_id), int(topic_id))).fetchone()
+        if existing:
+            conn.execute("DELETE FROM class_topic_assignments WHERE confirmation_id = ? AND topic_id = ?",
+                         (int(confirmation_id), int(topic_id)))
+            return False
+        conn.execute("""
+            INSERT INTO class_topic_assignments (confirmation_id, topic_id, status, updated_at)
+            VALUES (?, ?, 'Planned', ?)
+        """, (int(confirmation_id), int(topic_id), updated_at))
+    return True
+
+
+def set_chapter_topics_selected(confirmation_id, syllabus_id, chapter_id, teacher_id, selected, updated_at):
+    teacher_id = _lesson_teacher_id(teacher_id)
+    with connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        valid = conn.execute("""
+            SELECT 1 FROM class_syllabuses cs
+            JOIN confirmations active_class ON active_class.id = cs.confirmation_id
+            JOIN syllabus_chapters c ON c.syllabus_id = cs.syllabus_id
+            WHERE cs.confirmation_id = ? AND cs.syllabus_id = ? AND cs.teacher_id = ? AND c.id = ?
+              AND NOT EXISTS (
+                  SELECT 1 FROM makeup_obligations m
+                  WHERE m.session_id = active_class.session_id AND m.original_date = active_class.class_date
+              )
+        """, (int(confirmation_id), int(syllabus_id), teacher_id, int(chapter_id))).fetchone()
+        if not valid:
+            return False
+        leaf_ids = [row[0] for row in conn.execute("""
+            SELECT t.id FROM syllabus_topics t
+            WHERE t.chapter_id = ? AND NOT EXISTS (
+                SELECT 1 FROM syllabus_topics child WHERE child.parent_topic_id = t.id
+            )
+        """, (int(chapter_id),)).fetchall()]
+        if selected:
+            conn.executemany("""
+                INSERT OR IGNORE INTO class_topic_assignments
+                    (confirmation_id, topic_id, status, updated_at)
+                VALUES (?, ?, 'Planned', ?)
+            """, [(int(confirmation_id), topic_id, updated_at) for topic_id in leaf_ids])
+        elif leaf_ids:
+            conn.executemany(
+                "DELETE FROM class_topic_assignments WHERE confirmation_id = ? AND topic_id = ?",
+                [(int(confirmation_id), topic_id) for topic_id in leaf_ids],
+            )
+    return True
+
+
+def get_class_topic_assignments(confirmation_id, teacher_id):
+    teacher_id = _lesson_teacher_id(teacher_id)
+    with connect() as conn:
+        rows = conn.execute("""
+            SELECT a.confirmation_id, a.topic_id, a.status, a.note, a.updated_at,
+                   t.title AS topic_title, t.parent_topic_id, c.id AS chapter_id,
+                   c.title AS chapter_title, s.id AS syllabus_id, s.title AS syllabus_title
+            FROM class_topic_assignments a
+            JOIN syllabus_topics t ON t.id = a.topic_id
+            JOIN syllabus_chapters c ON c.id = t.chapter_id
+            JOIN syllabuses s ON s.id = c.syllabus_id
+            JOIN class_syllabuses cs
+              ON cs.confirmation_id = a.confirmation_id AND cs.syllabus_id = s.id
+            WHERE a.confirmation_id = ? AND cs.teacher_id = ? AND s.teacher_id = ?
+              AND NOT EXISTS (
+                  SELECT 1 FROM confirmations active_class
+                  JOIN makeup_obligations m
+                    ON m.session_id = active_class.session_id AND m.original_date = active_class.class_date
+                  WHERE active_class.id = a.confirmation_id
+              )
+            ORDER BY s.title, c.position, t.position, t.id
+        """, (int(confirmation_id), teacher_id, teacher_id)).fetchall()
+    return [dict(row) for row in rows]
+
+
+def set_class_topic_status(confirmation_id, topic_id, teacher_id, status, updated_at, note=None):
+    teacher_id = _lesson_teacher_id(teacher_id)
+    allowed_statuses = {"Planned", "Partially covered", "Completed", "Not covered"}
+    if status not in allowed_statuses:
+        raise ValueError("Invalid lesson topic status.")
+    with connect() as conn:
+        cursor = conn.execute("""
+            UPDATE class_topic_assignments
+            SET status = ?, updated_at = ?, note = COALESCE(?, note)
+            WHERE confirmation_id = ? AND topic_id = ?
+              AND EXISTS (
+                SELECT 1 FROM class_syllabuses cs
+                JOIN confirmations active_class ON active_class.id = cs.confirmation_id
+                JOIN syllabuses s ON s.id = cs.syllabus_id AND s.teacher_id = cs.teacher_id
+                JOIN syllabus_chapters c ON c.syllabus_id = s.id
+                JOIN syllabus_topics t ON t.chapter_id = c.id AND t.id = class_topic_assignments.topic_id
+                WHERE cs.confirmation_id = class_topic_assignments.confirmation_id
+                  AND cs.teacher_id = ? AND s.teacher_id = ?
+                  AND NOT EXISTS (
+                    SELECT 1 FROM makeup_obligations m
+                    WHERE m.session_id = active_class.session_id AND m.original_date = active_class.class_date
+                  )
+              )
+        """, (status, updated_at, note, int(confirmation_id), int(topic_id), teacher_id, teacher_id))
+    return cursor.rowcount == 1
+
+
+def set_class_topic_note(confirmation_id, topic_id, teacher_id, note, updated_at):
+    note = str(note).strip()
+    if len(note) > 500:
+        raise ValueError("Notes can be at most 500 characters.")
+    teacher_id = _lesson_teacher_id(teacher_id)
+    with connect() as conn:
+        cursor = conn.execute("""
+            UPDATE class_topic_assignments SET note = ?, updated_at = ?
+            WHERE confirmation_id = ? AND topic_id = ?
+              AND EXISTS (
+                SELECT 1 FROM class_syllabuses cs
+                JOIN confirmations active_class ON active_class.id = cs.confirmation_id
+                JOIN syllabuses s ON s.id = cs.syllabus_id AND s.teacher_id = cs.teacher_id
+                WHERE cs.confirmation_id = class_topic_assignments.confirmation_id
+                  AND cs.teacher_id = ? AND s.teacher_id = ?
+                  AND NOT EXISTS (
+                    SELECT 1 FROM makeup_obligations m
+                    WHERE m.session_id = active_class.session_id AND m.original_date = active_class.class_date
+                  )
+              )
+        """, (note, updated_at, int(confirmation_id), int(topic_id), teacher_id, teacher_id))
+    return cursor.rowcount == 1
+
+
+def get_syllabus_progress(syllabus_id, teacher_id):
+    teacher_id = _lesson_teacher_id(teacher_id)
+    syllabus = get_syllabus(syllabus_id, teacher_id)
+    if not syllabus:
+        return None
+    with connect() as conn:
+        total = conn.execute("""
+            SELECT COUNT(*) FROM syllabus_topics t
+            JOIN syllabus_chapters c ON c.id = t.chapter_id WHERE c.syllabus_id = ?
+        """, (int(syllabus_id),)).fetchone()[0]
+        completed = conn.execute("""
+            SELECT COUNT(DISTINCT t.id) FROM syllabus_topics t
+            JOIN syllabus_chapters c ON c.id = t.chapter_id
+            JOIN class_topic_assignments a ON a.topic_id = t.id AND a.status = 'Completed'
+            JOIN class_syllabuses cs ON cs.confirmation_id = a.confirmation_id
+                AND cs.syllabus_id = c.syllabus_id AND cs.teacher_id = ?
+            JOIN confirmations active_class ON active_class.id = a.confirmation_id
+            WHERE c.syllabus_id = ? AND NOT EXISTS (
+                SELECT 1 FROM makeup_obligations m
+                WHERE m.session_id = active_class.session_id AND m.original_date = active_class.class_date
+            )
+        """, (teacher_id, int(syllabus_id))).fetchone()[0]
+        partial = conn.execute("""
+            SELECT COUNT(DISTINCT t.id) FROM syllabus_topics t
+            JOIN syllabus_chapters c ON c.id = t.chapter_id
+            JOIN class_topic_assignments a ON a.topic_id = t.id AND a.status = 'Partially covered'
+            JOIN class_syllabuses cs ON cs.confirmation_id = a.confirmation_id
+                AND cs.syllabus_id = c.syllabus_id AND cs.teacher_id = ?
+            JOIN confirmations active_class ON active_class.id = a.confirmation_id
+            WHERE c.syllabus_id = ? AND NOT EXISTS (
+                SELECT 1 FROM class_topic_assignments done
+                JOIN class_syllabuses done_cs ON done_cs.confirmation_id = done.confirmation_id
+                    AND done_cs.syllabus_id = c.syllabus_id AND done_cs.teacher_id = ?
+                JOIN confirmations done_class ON done_class.id = done.confirmation_id
+                WHERE done.topic_id = t.id AND done.status = 'Completed'
+                  AND NOT EXISTS (
+                    SELECT 1 FROM makeup_obligations m
+                    WHERE m.session_id = done_class.session_id AND m.original_date = done_class.class_date
+                  )
+            )
+              AND NOT EXISTS (
+                  SELECT 1 FROM makeup_obligations m
+                  WHERE m.session_id = active_class.session_id AND m.original_date = active_class.class_date
+              )
+        """, (teacher_id, int(syllabus_id), teacher_id)).fetchone()[0]
+        planned = conn.execute("""
+            SELECT COUNT(DISTINCT t.id) FROM syllabus_topics t
+            JOIN syllabus_chapters c ON c.id = t.chapter_id
+            JOIN class_topic_assignments a ON a.topic_id = t.id AND a.status = 'Planned'
+            JOIN class_syllabuses cs ON cs.confirmation_id = a.confirmation_id
+                AND cs.syllabus_id = c.syllabus_id AND cs.teacher_id = ?
+            JOIN confirmations active_class ON active_class.id = a.confirmation_id
+            WHERE c.syllabus_id = ? AND NOT EXISTS (
+                SELECT 1 FROM class_topic_assignments done
+                JOIN class_syllabuses done_cs ON done_cs.confirmation_id = done.confirmation_id
+                    AND done_cs.syllabus_id = c.syllabus_id AND done_cs.teacher_id = ?
+                JOIN confirmations done_class ON done_class.id = done.confirmation_id
+                WHERE done.topic_id = t.id AND done.status IN ('Completed', 'Partially covered')
+                  AND NOT EXISTS (
+                    SELECT 1 FROM makeup_obligations m
+                    WHERE m.session_id = done_class.session_id AND m.original_date = done_class.class_date
+                  )
+            )
+              AND NOT EXISTS (
+                  SELECT 1 FROM makeup_obligations m
+                  WHERE m.session_id = active_class.session_id AND m.original_date = active_class.class_date
+              )
+        """, (teacher_id, int(syllabus_id), teacher_id)).fetchone()[0]
+    total, completed, partial, planned = map(int, (total, completed, partial, planned))
+    return {
+        "total_topics": total,
+        "completed_topics": completed,
+        "partially_covered_topics": partial,
+        "planned_topics": planned,
+        "remaining_topics": max(0, total - completed),
+        "percent_complete": (100.0 * completed / total) if total else 0.0,
+    }

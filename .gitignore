@@ -1,0 +1,9 @@
+.env
+.env.*
+!.env.example
+.venv/
+__pycache__/
+*.py[cod]
+data/*.sqlite3
+data/*.sqlite3-*
+tmp/syllabus_uploads/

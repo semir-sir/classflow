@@ -1,3 +1,5 @@
 python-telegram-bot>=21.0,<23.0
 python-dotenv>=1.0,<2.0
 tzdata>=2024.1
+pypdf>=6.10,<7.0
+python-docx>=1.2.0,<2.0

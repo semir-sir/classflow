@@ -1,5 +1,6 @@
 import os
 import asyncio
+import logging
 from pathlib import Path
 from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
@@ -27,6 +28,12 @@ from timetable import (
 from makeup import (
     deliver_due_makeup_reminders, reminder_scheduler, notify_cancelled_groups,
     broadcast_scheduled_makeup,
+)
+from lesson_tracker import (
+    handle_callback as handle_lesson_callback,
+    handle_document_upload as handle_syllabus_document,
+    handle_text_input as handle_lesson_text,
+    post_confirmation_markup,
 )
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -71,6 +78,14 @@ SCHEDULE = load_timetable(SCHEDULE_PATH)
 if not SCHEDULE:
     raise RuntimeError(f"{SCHEDULE_PATH} has no schedule entries. Add the verified timetable first.")
 
+try:
+    SYLLABUS_MAX_UPLOAD_MB = int(os.getenv("SYLLABUS_MAX_UPLOAD_MB", "10"))
+except ValueError as exc:
+    raise RuntimeError("SYLLABUS_MAX_UPLOAD_MB must be an integer between 1 and 19.") from exc
+if not 1 <= SYLLABUS_MAX_UPLOAD_MB <= 19:
+    raise RuntimeError("SYLLABUS_MAX_UPLOAD_MB must be an integer between 1 and 19.")
+SYLLABUS_MAX_UPLOAD_BYTES = SYLLABUS_MAX_UPLOAD_MB * 1024 * 1024
+
 def is_teacher(update: Update) -> bool:
     user = update.effective_user
     return bool(user and user.id == TEACHER_TELEGRAM_ID)
@@ -81,6 +96,8 @@ def main_keyboard():
         [InlineKeyboardButton("❌ Cancel Regular Class", callback_data="makeup:cancel:list")],
         [InlineKeyboardButton("🗓️ Makeup Obligations", callback_data="makeup:list")],
         [InlineKeyboardButton("📊 Credit Check", callback_data="credit:start")],
+        [InlineKeyboardButton("📖 Lesson Tracker", callback_data="lesson:classes:0")],
+        [InlineKeyboardButton("📚 Syllabus Library", callback_data="lesson:library:0")],
     ])
 
 async def edit_message_if_changed(query, text, reply_markup=None):
@@ -289,6 +306,8 @@ async def show_credit_analysis(query, section):
     ]))
 
 async def plan_makeup_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if await handle_lesson_text(update, context, TEACHER_TELEGRAM_ID, TIMEZONE):
+        return
     obligation_id = context.user_data.get("pending_makeup_plan")
     if not obligation_id or not update.effective_message:
         return
@@ -345,6 +364,9 @@ async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     if not is_teacher(update):
         await query.edit_message_text("🔒 Sorry, this bot is for the authorized teacher only.")
+        return
+
+    if await handle_lesson_callback(query, context, TEACHER_TELEGRAM_ID, TIMEZONE):
         return
 
     data = query.data or ""
@@ -539,7 +561,7 @@ async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text(
                 f"ℹ️ This regular session is already confirmed for {class_date} ({existing['sections']}), "
                 f"{session['start']}–{session['end']}.",
-                reply_markup=main_keyboard()
+                reply_markup=post_confirmation_markup(existing["id"])
             )
             return
         context.user_data["pending_confirm"] = {"session": session, "class_date": class_date}
@@ -668,7 +690,11 @@ async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         summary.extend([f"  ▫️ Section {s}: {new_balances[s]:g}" for s in sections])
         summary.append(notification_status)
         context.user_data.pop("pending_confirm", None)
-        await query.edit_message_text("\n".join(summary), reply_markup=main_keyboard())
+        confirmation = get_confirmation(session["id"], class_date)
+        await query.edit_message_text(
+            "\n".join(summary),
+            reply_markup=post_confirmation_markup(confirmation["id"]) if confirmation else main_keyboard(),
+        )
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_teacher(update):
@@ -689,6 +715,11 @@ async def stop_makeup_reminder_task(application: Application):
     if task:
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)
+
+async def syllabus_document_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await handle_syllabus_document(
+        update, context, TEACHER_TELEGRAM_ID, TIMEZONE, SYLLABUS_MAX_UPLOAD_BYTES
+    )
 
 def main():
     try:
@@ -718,6 +749,7 @@ def main():
         app.add_handler(CommandHandler("makeups", makeups_command))
         app.add_handler(CommandHandler("myid", my_id))
         app.add_handler(CommandHandler("groupid", group_id))
+        app.add_handler(MessageHandler(filters.Document.ALL, syllabus_document_upload))
         app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, plan_makeup_text))
         app.add_handler(CallbackQueryHandler(callback))
         print("ClassFlow Confirm Regular Class module is running.", flush=True)

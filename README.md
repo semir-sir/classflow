@@ -25,6 +25,13 @@ Group and private notifications are mocked in the tests. No test sends a real Te
 ## Credit analysis
 The teacher can select **Credit Check**, then Section A or Section B. The report compares the section's remaining balance with the 64.0-hour baseline, displays hours used and remaining, both percentages, a 20-cell used-hours bar, and active sessions logged. Active sessions count confirmed regular occurrences not recorded as cancelled plus makeup obligations marked Planned with a scheduled time or Completed. The calculation reads the existing SQLite balances and records; it does not change them.
 
+## Syllabus upload and lesson topic tracking
+In a private chat, the authorized teacher can upload a text-based PDF or DOCX. ClassFlow extracts likely chapters and numbered or styled headings locally, then saves only a pending outline for review. The teacher can set the course title, rename or remove extracted entries, and add chapters, topics, or nested subtopics. Nothing becomes an active syllabus until **Confirm Syllabus** is selected. Cancelling removes the pending outline; uploaded document files are held in a temporary file and deleted after extraction.
+
+After confirming a regular class, choose **Prepare Lesson**, or open **Lesson Tracker** later. Choose the appropriate syllabus, expand a chapter, and select individual topics or all leaf subtopics in that chapter. Selected topics start as **Planned**. After class, each selected topic can be marked Planned, Partially covered, Completed, or Not covered, with an optional note. Syllabus progress counts unique topics, so assigning one topic to multiple classes does not inflate completion. Syllabuses, class links, topic assignments, statuses, and notes are stored in additive SQLite tables.
+
+PDF and DOCX parsing happens locally; no OCR or external AI service is used. Scanned/image-only PDFs are reported as unreadable until OCR is added in a future feature. The default upload limit is 10 MB and can be changed with `SYLLABUS_MAX_UPLOAD_MB` (1–19 MB, kept below Telegram's current 20 MB bot-download limit). Install the new dependencies with `python -m pip install -r requirements.txt`, then restart the existing bot with `python bot.py`.
+
 ## Database migration
 At startup, `init_db()` creates the makeup tables if absent. For databases with the earlier confirmed-only schema, it rebuilds the two makeup tables to make `confirmation_id` optional and adds a unique `(session_id, original_date)` key. Existing obligations and group notification state are copied; confirmations and balances are preserved. The occurrence key prevents duplicate cancellation records even when no confirmation exists.
 
