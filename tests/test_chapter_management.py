@@ -1,18 +1,15 @@
 import asyncio
-import io
 import sqlite3
 import tempfile
 import time
 import unittest
-import zipfile
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
-from pypdf import PdfWriter
 
 import database
 from chapter_management import (
-    CHAPTERS_PER_PAGE, _chapter_view, _list_view, _validate_material_file, handle_chapter_callback,
+    CHAPTERS_PER_PAGE, _chapter_view, _list_view, handle_chapter_callback,
     handle_chapter_document, handle_chapter_text,
 )
 
@@ -32,23 +29,6 @@ class FakeMessage:
 
     async def reply_text(self, text, **kwargs):
         self.replies.append((text, kwargs.get("reply_markup")))
-
-
-class FakeTelegramFile:
-    def __init__(self, filename):
-        self.filename = filename
-
-    async def download_to_drive(self, custom_path):
-        if self.filename.lower().endswith(".pdf"):
-            writer = PdfWriter()
-            writer.add_blank_page(width=72, height=72)
-            buffer = io.BytesIO()
-            writer.write(buffer)
-            Path(custom_path).write_bytes(buffer.getvalue())
-        else:
-            with zipfile.ZipFile(custom_path, "w") as archive:
-                archive.writestr("[Content_Types].xml", "<Types xmlns='http://schemas.openxmlformats.org/package/2006/content-types'/>")
-                archive.writestr("word/document.xml", "<document xmlns='http://schemas.openxmlformats.org/wordprocessingml/2006/main'/>")
 
 
 class FakeQuery:
@@ -103,9 +83,6 @@ class ChapterManagementTests(unittest.TestCase):
             file_name=filename, mime_type=mime, file_size=size,
             file_id=file_id, file_unique_id=unique_id,
         )
-        async def get_file():
-            return FakeTelegramFile(filename)
-        document.get_file = get_file
         return document
 
     def update(self, message, user=TEACHER, chat_id=77, chat_type="private"):
@@ -189,7 +166,7 @@ class ChapterManagementTests(unittest.TestCase):
         first, second = self.chapters()[:2]
         text, markup = _chapter_view(first, 0)
         self.assertIn("No teaching material", text)
-        self.assertIn("PDF or DOCX", text)
+        self.assertIn("any file type", text)
         self.assertTrue(any(button.callback_data == f"chapter:upload:{first['id']}:0"
                             for row in markup.inline_keyboard for button in row))
 
@@ -211,39 +188,28 @@ class ChapterManagementTests(unittest.TestCase):
         self.assertIn("Material attached", message.replies[0][0])
         self.assertEqual(saved_first["filename"], "notes.pdf")
 
-    def test_invalid_oversized_and_mime_mismatch_are_rejected_without_attach(self):
-        chapter = self.chapters()[0]
-        context = FakeContext({"chapter_upload": self.upload_state(chapter["id"])})
-        for document, expected in [
-            (self.make_doc("slides.pptx", "application/octet-stream"), "PDF or DOCX"),
-            (self.make_doc("bad.pdf", "text/plain"), "does not match"),
-            (self.make_doc("large.pdf", "application/pdf", size=1001), "upload limit"),
-        ]:
+    def test_multiple_document_types_are_accepted_but_oversized_uploads_are_rejected(self):
+        chapters = self.chapters()[:3]
+        for chapter, document in zip(chapters, [
+            self.make_doc("slides.pptx", "application/vnd.openxmlformats-officedocument.presentationml.presentation", file_id="pptx-file"),
+            self.make_doc("table.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", file_id="xlsx-file"),
+            self.make_doc("drawing.custom", "application/x-custom", file_id="custom-file"),
+        ]):
+            context = FakeContext({"chapter_upload": self.upload_state(chapter["id"])})
             message = FakeMessage(document=document)
-            asyncio.run(handle_chapter_document(self.update(message), context, TEACHER, TIMEZONE, 1000))
-            self.assertIn(expected, message.replies[-1][0])
-            self.assertFalse(database.get_teacher_chapter(chapter["id"], TEACHER)["material_attached"])
-            self.assertIn("chapter_upload", context.user_data)
+            handled = asyncio.run(handle_chapter_document(self.update(message), context, TEACHER, TIMEZONE, 1000))
+            self.assertTrue(handled)
+            saved = database.get_teacher_chapter(chapter["id"], TEACHER)
+            self.assertEqual(saved["file_id"], document.file_id)
+            self.assertEqual(saved["filename"], document.file_name)
+            self.assertEqual(saved["mime_type"], document.mime_type)
 
-    def test_pdf_and_docx_structure_validation(self):
-        with tempfile.TemporaryDirectory() as directory:
-            pdf = Path(directory) / "valid.pdf"
-            writer = PdfWriter()
-            writer.add_blank_page(width=72, height=72)
-            with pdf.open("wb") as stream:
-                writer.write(stream)
-            _validate_material_file(pdf, ".pdf")
-
-            docx = Path(directory) / "valid.docx"
-            with zipfile.ZipFile(docx, "w") as archive:
-                archive.writestr("[Content_Types].xml", "<Types xmlns='http://schemas.openxmlformats.org/package/2006/content-types'/>")
-                archive.writestr("word/document.xml", "<document xmlns='http://schemas.openxmlformats.org/wordprocessingml/2006/main'/>")
-            _validate_material_file(docx, ".docx")
-
-            damaged = Path(directory) / "damaged.docx"
-            damaged.write_bytes(b"not a docx")
-            with self.assertRaisesRegex(ValueError, "damaged"):
-                _validate_material_file(damaged, ".docx")
+        chapter = self.chapters()[3]
+        context = FakeContext({"chapter_upload": self.upload_state(chapter["id"])})
+        oversized = FakeMessage(document=self.make_doc("large.pptx", "application/octet-stream", size=1001))
+        asyncio.run(handle_chapter_document(self.update(oversized), context, TEACHER, TIMEZONE, 1000))
+        self.assertIn("upload limit", oversized.replies[-1][0])
+        self.assertFalse(database.get_teacher_chapter(chapter["id"], TEACHER)["material_attached"])
 
     def test_switching_or_text_cancels_pending_upload_and_does_not_leak_to_other_chapter(self):
         database.ensure_default_teacher_chapters(TEACHER, "now")

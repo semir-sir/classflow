@@ -1,17 +1,13 @@
 """Teacher-owned chapter list and chapter-specific Telegram material uploads."""
 
 import logging
-import tempfile
 from datetime import datetime
 from pathlib import Path
 import time
-import xml.etree.ElementTree as ET
-import zipfile
 from zoneinfo import ZoneInfo
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.error import TelegramError
-from pypdf import PdfReader
 
 import database
 
@@ -21,15 +17,6 @@ MAX_CHAPTER_NAME = 80
 UPLOAD_SELECTION_TTL_SECONDS = 15 * 60
 MAX_DOCX_ZIP_ENTRIES = 2_000
 MAX_DOCX_EXPANDED_BYTES = 50 * 1024 * 1024
-MATERIAL_MIME_TYPES = {
-    ".pdf": {"application/pdf", "application/octet-stream"},
-    ".docx": {
-        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-        "application/octet-stream",
-    },
-}
-
-
 def _now(timezone):
     return datetime.now(ZoneInfo(timezone)).isoformat(timespec="seconds")
 
@@ -38,43 +25,6 @@ def _safe_filename(value):
     filename = Path((str(value or "").replace("\\", "/"))).name
     filename = "".join(char for char in filename if char.isprintable() and char not in "\r\n")[:180]
     return filename or "teaching-material"
-
-
-def _validate_material_file(path, suffix):
-    """Validate the actual temporary document structure without retaining its bytes."""
-    if suffix == ".pdf":
-        with Path(path).open("rb") as source:
-            if source.read(5) != b"%PDF-":
-                raise ValueError("That file is not a valid PDF. Please upload a PDF or DOCX document.")
-        import logging as _logging
-        pdf_logger = _logging.getLogger("pypdf")
-        prior_level = pdf_logger.level
-        pdf_logger.setLevel(_logging.CRITICAL + 1)
-        try:
-            reader = PdfReader(str(path), strict=False)
-            if reader.is_encrypted or not reader.pages:
-                raise ValueError("That PDF is encrypted or has no readable pages. Upload an unlocked PDF or DOCX.")
-        except ValueError:
-            raise
-        except Exception as exc:
-            raise ValueError("That PDF appears to be damaged. Please upload a valid PDF or DOCX.") from exc
-        finally:
-            pdf_logger.setLevel(prior_level)
-        return
-    try:
-        with zipfile.ZipFile(path) as archive:
-            entries = archive.infolist()
-            if len(entries) > MAX_DOCX_ZIP_ENTRIES or sum(item.file_size for item in entries) > MAX_DOCX_EXPANDED_BYTES:
-                raise ValueError("That DOCX expands beyond the safe validation limit.")
-            names = {item.filename for item in entries}
-            if not {"[Content_Types].xml", "word/document.xml"}.issubset(names):
-                raise ValueError("That file is not a valid DOCX. Please upload a PDF or DOCX document.")
-            ET.fromstring(archive.read("[Content_Types].xml"))
-            ET.fromstring(archive.read("word/document.xml"))
-    except ValueError:
-        raise
-    except (OSError, zipfile.BadZipFile, KeyError, ET.ParseError) as exc:
-        raise ValueError("That DOCX appears to be damaged. Please upload a valid PDF or DOCX.") from exc
 
 
 def _list_view(teacher_id, page):
@@ -121,10 +71,10 @@ def _chapter_view(chapter, page):
         text = (
             f"📚 Chapter: {chapter['name']}\n\n"
             "No teaching material has been uploaded for this chapter yet.\n\n"
-            "Please upload a PDF or DOCX file to add teaching material to this chapter."
+            "Send any file type as a document to attach teaching material to this chapter."
         )
         rows.append([InlineKeyboardButton(
-            "📎 Upload PDF/DOCX", callback_data=f"chapter:upload:{chapter['id']}:{page}"
+            "📎 Upload Material", callback_data=f"chapter:upload:{chapter['id']}:{page}"
         )])
     else:
         text = (
@@ -215,7 +165,7 @@ async def handle_chapter_callback(query, context, teacher_id, timezone):
         }
         verb = "replace" if chapter["material_attached"] else "attach"
         await query.edit_message_text(
-            f"📎 Send the PDF or DOCX document you want to {verb} to {chapter['name']}.\n\n"
+            f"📎 Send the file you want to {verb} to {chapter['name']}. Any document file type is accepted.\n\n"
             "This selection is tied only to this chapter. Use Cancel before choosing another chapter.",
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("❌ Cancel Upload", callback_data=f"chapter:uploadcancel:{chapter_id}:{page}")],
@@ -333,52 +283,17 @@ async def handle_chapter_document(update, context, teacher_id, timezone, max_upl
         return True
     document = message.document
     filename = _safe_filename(document.file_name)
-    suffix = Path(filename).suffix.casefold()
-    if suffix not in MATERIAL_MIME_TYPES:
-        await message.reply_text("📎 Chapter material must be a PDF or DOCX file. Your chapter selection is still active.")
-        return True
     mime_type = (document.mime_type or "").split(";", 1)[0].strip().lower()
-    if mime_type and mime_type not in MATERIAL_MIME_TYPES[suffix]:
-        await message.reply_text("⚠️ The file type does not match its extension. Please send a valid PDF or DOCX.")
-        return True
     if document.file_size is not None and document.file_size > max_upload_bytes:
         await message.reply_text(f"⚠️ This file is larger than the {max_upload_bytes // (1024 * 1024)} MB upload limit.")
         return True
     if document.file_size is None:
         await message.reply_text("⚠️ Telegram didn't provide the file size, so I can't safely accept it. Please upload it again.")
         return True
-    temporary_path = None
-    try:
-        with tempfile.NamedTemporaryFile(prefix="classflow_chapter_", suffix=suffix, delete=False) as stream:
-            temporary_path = Path(stream.name)
-        telegram_file = await document.get_file()
-        await telegram_file.download_to_drive(custom_path=temporary_path)
-        if temporary_path.stat().st_size > max_upload_bytes:
-            await message.reply_text(f"⚠️ This file is larger than the {max_upload_bytes // (1024 * 1024)} MB upload limit.")
-            return True
-        _validate_material_file(temporary_path, suffix)
-    except ValueError as exc:
-        await message.reply_text(f"⚠️ {exc}")
-        return True
-    except TelegramError as exc:
-        logging.getLogger(__name__).warning("Chapter material download failed (%s).", type(exc).__name__)
-        await message.reply_text("⚠️ Telegram could not validate the uploaded file. Please try sending it again.")
-        return True
-    except OSError:
-        logging.getLogger(__name__).warning("Temporary chapter material validation failed.")
-        await message.reply_text("⚠️ I couldn't validate this file on the server. Please try again later.")
-        return True
-    finally:
-        if temporary_path and temporary_path.exists():
-            try:
-                temporary_path.unlink()
-            except OSError:
-                logging.getLogger(__name__).warning("Could not remove temporary chapter material file.")
     # Recheck ownership at commit time. Telegram file IDs persist the attachment
-    # without keeping a duplicate local copy of the teacher's document.
+    # without downloading or restricting the teacher's document format.
     try:
-        expected_mime = "application/pdf" if suffix == ".pdf" else "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-        stored_mime = expected_mime if mime_type in {"", "application/octet-stream"} else mime_type
+        stored_mime = mime_type or "application/octet-stream"
         saved = database.attach_chapter_material(
             chapter["id"], teacher_id, document.file_id, document.file_unique_id,
             filename, stored_mime,
