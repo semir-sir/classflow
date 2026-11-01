@@ -35,6 +35,11 @@ from lesson_tracker import (
     handle_text_input as handle_lesson_text,
     post_confirmation_markup,
 )
+from chapter_management import (
+    handle_chapter_callback,
+    handle_chapter_document,
+    handle_chapter_text,
+)
 
 BASE_DIR = Path(__file__).resolve().parent
 load_dotenv(BASE_DIR / ".env")
@@ -98,6 +103,7 @@ def main_keyboard():
         [InlineKeyboardButton("📊 Credit Check", callback_data="credit:start")],
         [InlineKeyboardButton("📖 Lesson Tracker", callback_data="lesson:classes:0")],
         [InlineKeyboardButton("📚 Syllabus Library", callback_data="lesson:library:0")],
+        [InlineKeyboardButton("🗂️ Chapter Management", callback_data="chapter:list:0")],
     ])
 
 async def edit_message_if_changed(query, text, reply_markup=None):
@@ -111,6 +117,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_teacher(update):
         await update.message.reply_text("🔒 Sorry, this bot is for the authorized teacher only.")
         return
+    context.user_data.pop("chapter_upload", None)
+    context.user_data.pop("chapter_add", None)
     await update.message.reply_text(
         "🎓 ClassFlow\nChoose an action:",
         reply_markup=main_keyboard()
@@ -179,6 +187,8 @@ async def makeups_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_teacher(update):
         await update.effective_message.reply_text("🔒 Sorry, this bot is for the authorized teacher only.")
         return
+    context.user_data.pop("chapter_upload", None)
+    context.user_data.pop("chapter_add", None)
     obligations = list_makeup_obligations()
     if not obligations:
         await update.effective_message.reply_text("✅ There are no pending makeup obligations.")
@@ -306,6 +316,8 @@ async def show_credit_analysis(query, section):
     ]))
 
 async def plan_makeup_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if await handle_chapter_text(update, context, TEACHER_TELEGRAM_ID, TIMEZONE):
+        return
     if await handle_lesson_text(update, context, TEACHER_TELEGRAM_ID, TIMEZONE):
         return
     obligation_id = context.user_data.get("pending_makeup_plan")
@@ -332,6 +344,8 @@ async def my_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show the caller's sender ID only in a private chat for setup diagnostics."""
     if not update.effective_message:
         return
+    context.user_data.pop("chapter_upload", None)
+    context.user_data.pop("chapter_add", None)
     if not update.effective_chat or update.effective_chat.type != "private":
         await update.effective_message.reply_text("🔒 For privacy, use /myid in a private chat with this bot.")
         return
@@ -347,6 +361,8 @@ async def group_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat
     if not message or not chat:
         return
+    context.user_data.pop("chapter_upload", None)
+    context.user_data.pop("chapter_add", None)
     if chat.type == "private":
         await message.reply_text("👥 Run /groupid inside the group that should receive class notifications.")
         return
@@ -364,6 +380,9 @@ async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     if not is_teacher(update):
         await query.edit_message_text("🔒 Sorry, this bot is for the authorized teacher only.")
+        return
+
+    if await handle_chapter_callback(query, context, TEACHER_TELEGRAM_ID, TIMEZONE):
         return
 
     if await handle_lesson_callback(query, context, TEACHER_TELEGRAM_ID, TIMEZONE):
@@ -701,6 +720,8 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("🔒 Sorry, this bot is for the authorized teacher only.")
         return
     context.user_data.pop("pending_confirm", None)
+    context.user_data.pop("chapter_upload", None)
+    context.user_data.pop("chapter_add", None)
     await update.message.reply_text("✅ Current action cancelled.", reply_markup=main_keyboard())
 
 async def start_makeup_reminder_task(application: Application):
@@ -717,6 +738,10 @@ async def stop_makeup_reminder_task(application: Application):
         await asyncio.gather(task, return_exceptions=True)
 
 async def syllabus_document_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if await handle_chapter_document(
+        update, context, TEACHER_TELEGRAM_ID, TIMEZONE, SYLLABUS_MAX_UPLOAD_BYTES
+    ):
+        return
     await handle_syllabus_document(
         update, context, TEACHER_TELEGRAM_ID, TIMEZONE, SYLLABUS_MAX_UPLOAD_BYTES
     )

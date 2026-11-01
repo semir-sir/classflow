@@ -225,6 +225,29 @@ def init_db(initial_balances=None):
         conn.execute("CREATE INDEX IF NOT EXISTS idx_syllabus_topics_chapter ON syllabus_topics(chapter_id, parent_topic_id, position)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_class_topic_status ON class_topic_assignments(topic_id, status)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_class_syllabuses_teacher ON class_syllabuses(teacher_id, confirmation_id)")
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS teacher_chapters (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                teacher_id INTEGER NOT NULL,
+                name TEXT NOT NULL COLLATE NOCASE,
+                position INTEGER NOT NULL,
+                created_at TEXT NOT NULL,
+                UNIQUE(teacher_id, name)
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS chapter_materials (
+                chapter_id INTEGER PRIMARY KEY REFERENCES teacher_chapters(id) ON DELETE CASCADE,
+                teacher_id INTEGER NOT NULL,
+                file_id TEXT NOT NULL,
+                file_unique_id TEXT NOT NULL DEFAULT '',
+                filename TEXT NOT NULL,
+                mime_type TEXT NOT NULL,
+                uploaded_at TEXT NOT NULL
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_teacher_chapters_owner ON teacher_chapters(teacher_id, position, id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_chapter_material_owner ON chapter_materials(teacher_id, chapter_id)")
 
 def get_balances():
     with connect() as conn:
@@ -1176,3 +1199,128 @@ def get_syllabus_progress(syllabus_id, teacher_id):
         "remaining_topics": max(0, total - completed),
         "percent_complete": (100.0 * completed / total) if total else 0.0,
     }
+
+
+DEFAULT_TEACHER_CHAPTERS = tuple(f"Chapter {number}" for number in range(1, 6))
+
+
+def ensure_default_teacher_chapters(teacher_id, created_at):
+    """Create the five starter chapters once, atomically, for a teacher."""
+    teacher_id = _lesson_teacher_id(teacher_id)
+    with connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        existing = conn.execute(
+            "SELECT COUNT(*) FROM teacher_chapters WHERE teacher_id = ?", (teacher_id,)
+        ).fetchone()[0]
+        if existing == 0:
+            conn.executemany(
+                "INSERT INTO teacher_chapters (teacher_id, name, position, created_at) VALUES (?, ?, ?, ?)",
+                [(teacher_id, name, position, created_at)
+                 for position, name in enumerate(DEFAULT_TEACHER_CHAPTERS)],
+            )
+    return list_teacher_chapters(teacher_id, limit=5, offset=0)
+
+
+def list_teacher_chapters(teacher_id, limit=5, offset=0):
+    teacher_id = _lesson_teacher_id(teacher_id)
+    limit = max(1, min(50, int(limit)))
+    offset = max(0, int(offset))
+    with connect() as conn:
+        total = conn.execute(
+            "SELECT COUNT(*) FROM teacher_chapters WHERE teacher_id = ?", (teacher_id,)
+        ).fetchone()[0]
+        rows = conn.execute("""
+            SELECT c.id, c.teacher_id, c.name, c.position, c.created_at,
+                   m.file_id, m.file_unique_id, m.filename, m.mime_type, m.uploaded_at
+            FROM teacher_chapters c
+            LEFT JOIN chapter_materials m
+              ON m.chapter_id = c.id AND m.teacher_id = c.teacher_id
+            WHERE c.teacher_id = ?
+            ORDER BY c.position, c.id
+            LIMIT ? OFFSET ?
+        """, (teacher_id, limit, offset)).fetchall()
+    items = []
+    for row in rows:
+        item = dict(row)
+        item["material_attached"] = bool(item["file_id"])
+        items.append(item)
+    return {"items": items, "total": int(total)}
+
+
+def get_teacher_chapter(chapter_id, teacher_id):
+    teacher_id = _lesson_teacher_id(teacher_id)
+    with connect() as conn:
+        row = conn.execute("""
+            SELECT c.id, c.teacher_id, c.name, c.position, c.created_at,
+                   m.file_id, m.file_unique_id, m.filename, m.mime_type, m.uploaded_at
+            FROM teacher_chapters c
+            LEFT JOIN chapter_materials m
+              ON m.chapter_id = c.id AND m.teacher_id = c.teacher_id
+            WHERE c.id = ? AND c.teacher_id = ?
+        """, (int(chapter_id), teacher_id)).fetchone()
+    if not row:
+        return None
+    item = dict(row)
+    item["material_attached"] = bool(item["file_id"])
+    return item
+
+
+def add_teacher_chapter(teacher_id, name, created_at):
+    teacher_id = _lesson_teacher_id(teacher_id)
+    name = " ".join(str(name or "").split())
+    if not name:
+        raise ValueError("Enter a chapter name.")
+    if len(name) > 80:
+        raise ValueError("Chapter names must be 80 characters or fewer.")
+    with connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        existing_names = conn.execute(
+            "SELECT name FROM teacher_chapters WHERE teacher_id = ?", (teacher_id,)
+        ).fetchall()
+        if any(row["name"].casefold() == name.casefold() for row in existing_names):
+            raise ValueError("A chapter with that name already exists.")
+        position = conn.execute(
+            "SELECT COALESCE(MAX(position), -1) + 1 FROM teacher_chapters WHERE teacher_id = ?",
+            (teacher_id,),
+        ).fetchone()[0]
+        cursor = conn.execute("""
+            INSERT INTO teacher_chapters (teacher_id, name, position, created_at)
+            VALUES (?, ?, ?, ?)
+        """, (teacher_id, name, position, created_at))
+        chapter_id = cursor.lastrowid
+    return get_teacher_chapter(chapter_id, teacher_id)
+
+
+def attach_chapter_material(chapter_id, teacher_id, file_id, file_unique_id,
+                            filename, mime_type, uploaded_at):
+    """Attach or replace one Telegram document after verifying chapter ownership."""
+    teacher_id = _lesson_teacher_id(teacher_id)
+    file_id = str(file_id or "").strip()
+    if not file_id:
+        raise ValueError("Telegram did not provide a reusable file identifier.")
+    filename = " ".join(str(filename or "").split())[:180]
+    mime_type = str(mime_type or "").split(";", 1)[0].strip().lower()
+    if not filename or not mime_type:
+        raise ValueError("The file metadata is incomplete; please upload the document again.")
+    with connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        chapter = conn.execute(
+            "SELECT id FROM teacher_chapters WHERE id = ? AND teacher_id = ?",
+            (int(chapter_id), teacher_id),
+        ).fetchone()
+        if not chapter:
+            raise ValueError("That chapter does not belong to your account. Reopen Chapter Management and try again.")
+        conn.execute("""
+            INSERT INTO chapter_materials
+                (chapter_id, teacher_id, file_id, file_unique_id, filename, mime_type, uploaded_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(chapter_id) DO UPDATE SET
+                teacher_id = excluded.teacher_id,
+                file_id = excluded.file_id,
+                file_unique_id = excluded.file_unique_id,
+                filename = excluded.filename,
+                mime_type = excluded.mime_type,
+                uploaded_at = excluded.uploaded_at
+        """, (int(chapter_id), teacher_id, file_id, str(file_unique_id or ""),
+              filename, mime_type, uploaded_at))
+    return get_teacher_chapter(chapter_id, teacher_id)

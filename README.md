@@ -32,6 +32,12 @@ After confirming a regular class, choose **Prepare Lesson**, or open **Lesson Tr
 
 PDF, DOCX, and PPTX parsing happens locally; no OCR or external AI service is used. Text in PowerPoint slide shapes is extracted, but text embedded only in slide images cannot be read. Scanned/image-only PDFs are reported as unreadable until OCR is added in a future feature. The default upload limit is 10 MB and can be changed with `SYLLABUS_MAX_UPLOAD_MB` (1–19 MB, kept below Telegram's current 20 MB bot-download limit). Install the project dependencies with `python -m pip install -r requirements.txt`, then restart the existing bot with `python bot.py`.
 
+### Chapter Management
+
+The authorized teacher can open **Chapter Management** from the main menu. On first use, ClassFlow creates five empty chapters for that teacher. Chapter lists show five entries per page; additional chapters can be named and added without a fixed total limit. Empty chapters accept PDF or DOCX material up to `SYLLABUS_MAX_UPLOAD_MB`. The bot stores Telegram's reusable `file_id`, unique file ID, filename, MIME type, and upload time in SQLite, rather than keeping a second copy of the document on the bot host. Chapter ownership is checked both when opening the chapter and when saving the attachment. Replacing an existing attachment requires confirmation, and the previous file remains linked until the replacement metadata is saved.
+
+Chapter upload selection is held only for the current private chat and is cleared when the teacher cancels, enters text instead of a file, opens another menu, or restarts the bot. A pending selection is not persisted across restarts, preventing a later unrelated document from being attached to a stale chapter. Chapter metadata and Telegram file IDs persist in the existing SQLite database. Telegram must still recognize the stored file ID; if a saved ID can no longer be sent, the chapter screen asks the teacher to replace its material.
+
 ## Database migration
 At startup, `init_db()` creates the makeup tables if absent. For databases with the earlier confirmed-only schema, it rebuilds the two makeup tables to make `confirmation_id` optional and adds a unique `(session_id, original_date)` key. Existing obligations and group notification state are copied; confirmations and balances are preserved. The occurrence key prevents duplicate cancellation records even when no confirmation exists.
 
