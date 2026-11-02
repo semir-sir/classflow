@@ -23,7 +23,7 @@ from database import (
 )
 from timetable import (
     load_timetable, get_regular_sessions, find_conflicts,
-    most_recent_occurrence_date, confirmation_matches_timetable_date,
+    next_occurrence_date, confirmation_matches_timetable_date,
 )
 from makeup import (
     deliver_due_makeup_reminders, reminder_scheduler, notify_cancelled_groups,
@@ -375,6 +375,100 @@ async def begin_confirmation(query, context):
     keyboard.append([InlineKeyboardButton("❌ Cancel", callback_data="confirm:cancel")])
     await query.edit_message_text("✅ Choose the day of the regular System Analysis and Design class:", reply_markup=InlineKeyboardMarkup(keyboard))
 
+def confirmation_mode_keyboard(session):
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(f"👥 Section {session['section']} Only", callback_data="confirm:mode:single")],
+        [InlineKeyboardButton("👥 Combine Sections A + B", callback_data="confirm:mode:combined")],
+        [InlineKeyboardButton("❌ Cancel", callback_data="confirm:cancel")],
+    ])
+
+async def defer_confirmation_if_started(query, context, now_local=None):
+    """Prevent a delayed section choice from confirming a class that has started."""
+    pending = context.user_data.get("pending_confirm")
+    if not pending:
+        return False
+    session = pending["session"]
+    class_date = pending["class_date"]
+    timezone = ZoneInfo(TIMEZONE)
+    now_local = now_local or datetime.now(timezone)
+    occurrence_date = date.fromisoformat(class_date)
+    start_at = datetime.combine(
+        occurrence_date, datetime.strptime(session["start"], "%H:%M").time(), tzinfo=timezone
+    )
+    if now_local < start_at:
+        return False
+
+    obligation = get_makeup_occurrence(session["id"], class_date)
+    existing = get_confirmation_for_occurrence(session["id"], class_date, session["day"])
+    if existing and not obligation:
+        context.user_data.pop("pending_confirm", None)
+        await query.edit_message_text(
+            f"ℹ️ This regular session is already confirmed for {class_date} ({existing['sections']}), "
+            f"{session['start']}–{session['end']}.",
+            reply_markup=post_confirmation_markup(existing["id"]),
+        )
+        return True
+
+    end_at = datetime.combine(
+        occurrence_date, datetime.strptime(session["end"], "%H:%M").time(), tzinfo=timezone
+    )
+    notice = ""
+    if obligation:
+        notice = f"ℹ️ This occurrence is already tracked as makeup obligation #{obligation['id']}.\n"
+    elif now_local >= end_at:
+        obligation, created = cancel_scheduled_occurrence(
+            session_id=session["id"], original_date=class_date, day=session["day"],
+            course=session["course"], sections=[session["section"]], start=session["start"],
+            end=session["end"], duration_minutes=session["duration_minutes"],
+            reminder_date=(occurrence_date + timedelta(days=1)).isoformat(),
+            created_at=now_local.isoformat(timespec="seconds"),
+        )
+        if created:
+            failures = await notify_cancelled_groups(
+                context.bot, obligation, SECTION_GROUP_IDS, TIMEZONE
+            )
+            notice = f"⏰ The class on {class_date} ended before confirmation. Makeup obligation #{obligation['id']} was saved."
+            notice += (
+                f" Group notification failed for Section {', '.join(failures)}.\n"
+                if failures else " The section group was notified.\n"
+            )
+        else:
+            notice = f"ℹ️ This occurrence is already tracked as makeup obligation #{obligation['id']}.\n"
+    else:
+        notice = f"⏰ The class on {class_date} has already started and cannot be confirmed late.\n"
+
+    next_date = next_occurrence_date(session["day"], occurrence_date + timedelta(days=1))
+    for _ in range(52):
+        next_iso = next_date.isoformat()
+        if get_makeup_occurrence(session["id"], next_iso):
+            next_date = next_occurrence_date(session["day"], next_date + timedelta(days=1))
+            continue
+        next_confirmation = get_confirmation_for_occurrence(session["id"], next_iso, session["day"])
+        if next_confirmation:
+            await query.edit_message_text(
+                f"ℹ️ The next occurrence on {next_iso} is already confirmed "
+                f"({next_confirmation['sections']}). Choose the following occurrence from Confirm Regular Class.",
+                reply_markup=main_keyboard(),
+            )
+            context.user_data.pop("pending_confirm", None)
+            return True
+        break
+    else:
+        await query.edit_message_text(
+            "⚠️ I couldn't find an upcoming uncancelled occurrence in the next year.",
+            reply_markup=main_keyboard(),
+        )
+        context.user_data.pop("pending_confirm", None)
+        return True
+
+    context.user_data["pending_confirm"] = {"session": session, "class_date": next_date.isoformat()}
+    await query.edit_message_text(
+        f"{notice}\n✅ Choose sections for the next occurrence:\n📘 {session['course']}\n"
+        f"🕒 {session['day']} {session['start']}–{session['end']}\n🗓️ Class date: {next_date.isoformat()}",
+        reply_markup=confirmation_mode_keyboard(session),
+    )
+    return True
+
 async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -573,28 +667,117 @@ async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not session:
             await query.edit_message_text("⚠️ That timetable entry could not be found. Reload and try again.")
             return
-        today = datetime.now(ZoneInfo(TIMEZONE)).date()
-        class_date = most_recent_occurrence_date(session["day"], today).isoformat()
-        existing = get_confirmation_for_occurrence(session["id"], class_date, session["day"])
-        if existing:
+        now_local = datetime.now(ZoneInfo(TIMEZONE))
+        today = now_local.date()
+        class_date = next_occurrence_date(session["day"], today).isoformat()
+        occurrence_note = ""
+
+        # A same-day session is confirmable only before it starts. If it has
+        # ended without a confirmation, preserve it as a makeup obligation and
+        # continue with the next weekly occurrence instead of broadcasting a
+        # false confirmation or deducting credits for the missed class.
+        if class_date == today.isoformat():
+            current_obligation = get_makeup_occurrence(session["id"], class_date)
+            current_confirmation = get_confirmation_for_occurrence(
+                session["id"], class_date, session["day"]
+            )
+            if current_obligation:
+                occurrence_note = (
+                    f"ℹ️ The {class_date} occurrence is already cancelled and tracked as "
+                    f"makeup obligation #{current_obligation['id']}.\n"
+                )
+                class_date = next_occurrence_date(
+                    session["day"], today + timedelta(days=1)
+                ).isoformat()
+            elif current_confirmation:
+                await query.edit_message_text(
+                    f"ℹ️ This regular session is already confirmed for {class_date} "
+                    f"({current_confirmation['sections']}), {session['start']}–{session['end']}.",
+                    reply_markup=post_confirmation_markup(current_confirmation["id"]),
+                )
+                return
+            else:
+                start_at = datetime.combine(
+                    today, datetime.strptime(session["start"], "%H:%M").time(),
+                    tzinfo=now_local.tzinfo,
+                )
+                end_at = datetime.combine(
+                    today, datetime.strptime(session["end"], "%H:%M").time(),
+                    tzinfo=now_local.tzinfo,
+                )
+                if now_local >= start_at:
+                    if now_local >= end_at:
+                        current_obligation, created = cancel_scheduled_occurrence(
+                            session_id=session["id"], original_date=class_date,
+                            day=session["day"], course=session["course"],
+                            sections=[session["section"]], start=session["start"],
+                            end=session["end"], duration_minutes=session["duration_minutes"],
+                            reminder_date=(today + timedelta(days=1)).isoformat(),
+                            created_at=now_local.isoformat(timespec="seconds"),
+                        )
+                        if created:
+                            failures = await notify_cancelled_groups(
+                                context.bot, current_obligation, SECTION_GROUP_IDS, TIMEZONE
+                            )
+                            occurrence_note = (
+                                f"⏰ The {class_date} class had already ended. I saved it as makeup "
+                                f"obligation #{current_obligation['id']} and notified its section group.\n"
+                            )
+                            if failures:
+                                occurrence_note = (
+                                    f"⏰ The {class_date} class had already ended. I saved it as makeup "
+                                    f"obligation #{current_obligation['id']}; group notification failed for "
+                                    f"Section {', '.join(failures)}.\n"
+                                )
+                        else:
+                            occurrence_note = (
+                                f"ℹ️ The {class_date} occurrence is already tracked as makeup obligation "
+                                f"#{current_obligation['id']}.\n"
+                            )
+                    else:
+                        occurrence_note = (
+                            f"⏰ The {class_date} class has already started, so it cannot be confirmed late.\n"
+                        )
+                    class_date = next_occurrence_date(
+                        session["day"], today + timedelta(days=1)
+                    ).isoformat()
+
+        # A future date might itself have been cancelled earlier. Skip any such
+        # occurrence, but never roll back to a previous weekday.
+        for _ in range(52):
+            existing_obligation = get_makeup_occurrence(session["id"], class_date)
+            if existing_obligation:
+                if not occurrence_note:
+                    occurrence_note = (
+                        f"ℹ️ The {class_date} occurrence is already tracked as makeup obligation "
+                        f"#{existing_obligation['id']}.\n"
+                    )
+                next_date = date.fromisoformat(class_date) + timedelta(days=1)
+                class_date = next_occurrence_date(session["day"], next_date).isoformat()
+                continue
+            existing = get_confirmation_for_occurrence(session["id"], class_date, session["day"])
+            if existing:
+                await query.edit_message_text(
+                    f"ℹ️ This regular session is already confirmed for {class_date} ({existing['sections']}), "
+                    f"{session['start']}–{session['end']}.",
+                    reply_markup=post_confirmation_markup(existing["id"])
+                )
+                return
+            break
+        else:
             await query.edit_message_text(
-                f"ℹ️ This regular session is already confirmed for {class_date} ({existing['sections']}), "
-                f"{session['start']}–{session['end']}.",
-                reply_markup=post_confirmation_markup(existing["id"])
+                "⚠️ I couldn't find an upcoming uncancelled occurrence in the next year. Please contact support.",
+                reply_markup=main_keyboard(),
             )
             return
+
         context.user_data["pending_confirm"] = {"session": session, "class_date": class_date}
-        keyboard = [
-            [InlineKeyboardButton(f"👥 Section {session['section']} Only", callback_data="confirm:mode:single")],
-            [InlineKeyboardButton("👥 Combine Sections A + B", callback_data="confirm:mode:combined")],
-            [InlineKeyboardButton("❌ Cancel", callback_data="confirm:cancel")]
-        ]
         await query.edit_message_text(
-            f"✅ Regular class selected:\n📘 {session['course']} — Section {session['section']}\n"
+            f"{occurrence_note}✅ Regular class selected:\n📘 {session['course']} — Section {session['section']}\n"
             f"🕒 {session['day']} {session['start']}–{session['end']}\n"
             f"🗓️ Class date: {class_date}\n\n"
             "Teach this section only, or combine both sections?",
-            reply_markup=InlineKeyboardMarkup(keyboard)
+            reply_markup=confirmation_mode_keyboard(session)
         )
         return
 
@@ -602,6 +785,8 @@ async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pending = context.user_data.get("pending_confirm")
         if not pending:
             await query.edit_message_text("⏳ Your selection expired. Start again.", reply_markup=main_keyboard())
+            return
+        if await defer_confirmation_if_started(query, context):
             return
         session = pending["session"]
         class_date = pending["class_date"]
@@ -667,6 +852,8 @@ async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         now = datetime.now(ZoneInfo(TIMEZONE)).isoformat(timespec="seconds")
+        if await defer_confirmation_if_started(query, context, datetime.now(ZoneInfo(TIMEZONE))):
+            return
         try:
             confirm_session(
                 session_id=session["id"], day=session["day"], class_date=class_date, sections=sections,

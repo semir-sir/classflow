@@ -7,6 +7,7 @@ This is an isolated first module, not a replacement for your existing project. I
 - confirm the selected section alone, or combine A + B;
 - combined confirmation checks **every timetable row** for the other section during the same time interval;
 - duplicate-confirmation protection for the same session on the same real local calendar date;
+- confirms only before a class starts in the configured local timezone; an unconfirmed class selected after it ends becomes a makeup obligation and the next weekly occurrence is offered;
 - persistent SQLite storage;
 - transactional credit deductions, one duration deduction per confirmed section;
 - prevents confirmation if a section has insufficient credit hours.

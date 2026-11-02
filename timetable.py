@@ -33,6 +33,17 @@ def most_recent_occurrence_date(day, today):
         today = date.fromisoformat(today)
     return today - timedelta(days=(today.weekday() - weekdays[day]) % 7)
 
+def next_occurrence_date(day, from_date):
+    """Return the first date on or after from_date matching a timetable weekday."""
+    weekdays = {name: index for index, name in enumerate((
+        "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"
+    ))}
+    if day not in weekdays:
+        raise ValueError(f"Unknown timetable weekday: {day}")
+    if isinstance(from_date, str):
+        from_date = date.fromisoformat(from_date)
+    return from_date + timedelta(days=(weekdays[day] - from_date.weekday()) % 7)
+
 def confirmation_matches_timetable_date(confirmation):
     """Reject legacy confirmation rows saved against the wrong calendar weekday."""
     try:
