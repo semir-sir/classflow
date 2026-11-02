@@ -101,9 +101,7 @@ def main_keyboard():
         [InlineKeyboardButton("❌ Cancel Regular Class", callback_data="makeup:cancel:list")],
         [InlineKeyboardButton("🗓️ Makeup Obligations", callback_data="makeup:list")],
         [InlineKeyboardButton("📊 Credit Check", callback_data="credit:start")],
-        [InlineKeyboardButton("📖 Lesson Tracker", callback_data="lesson:classes:0")],
-        [InlineKeyboardButton("📚 Syllabus Library", callback_data="lesson:library:0")],
-        [InlineKeyboardButton("🗂️ Chapter Management", callback_data="chapter:list:0")],
+        [InlineKeyboardButton("📚 Courses & Lessons", callback_data="lesson:library:0")],
     ])
 
 async def edit_message_if_changed(query, text, reply_markup=None):
@@ -119,6 +117,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     context.user_data.pop("chapter_upload", None)
     context.user_data.pop("chapter_add", None)
+    context.user_data.pop("course_edit", None)
+    context.user_data.pop("course_material_upload", None)
     await update.message.reply_text(
         "🎓 ClassFlow\nChoose an action:",
         reply_markup=main_keyboard()

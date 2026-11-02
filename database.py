@@ -1,5 +1,6 @@
 import sqlite3
 import json
+import hashlib
 from datetime import date, datetime, timedelta
 from contextlib import contextmanager
 from pathlib import Path
@@ -189,9 +190,22 @@ def init_db(initial_balances=None):
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 syllabus_id INTEGER NOT NULL REFERENCES syllabuses(id) ON DELETE CASCADE,
                 position INTEGER NOT NULL,
-                title TEXT NOT NULL
+                title TEXT NOT NULL,
+                material_file_id TEXT,
+                material_filename TEXT,
+                material_mime_type TEXT,
+                material_uploaded_at TEXT
             )
         """)
+        chapter_columns = {row["name"] for row in conn.execute("PRAGMA table_info(syllabus_chapters)")}
+        for column, definition in (
+            ("material_file_id", "TEXT"),
+            ("material_filename", "TEXT"),
+            ("material_mime_type", "TEXT"),
+            ("material_uploaded_at", "TEXT"),
+        ):
+            if column not in chapter_columns:
+                conn.execute(f"ALTER TABLE syllabus_chapters ADD COLUMN {column} {definition}")
         conn.execute("""
             CREATE TABLE IF NOT EXISTS syllabus_topics (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -208,6 +222,14 @@ def init_db(initial_balances=None):
                 teacher_id INTEGER NOT NULL,
                 linked_at TEXT NOT NULL,
                 PRIMARY KEY(confirmation_id, syllabus_id)
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS course_syllabus_defaults (
+                teacher_id INTEGER NOT NULL,
+                course_name TEXT NOT NULL COLLATE NOCASE,
+                syllabus_id INTEGER NOT NULL REFERENCES syllabuses(id) ON DELETE CASCADE,
+                PRIMARY KEY (teacher_id, course_name)
             )
         """)
         conn.execute("""
@@ -839,6 +861,26 @@ def list_syllabuses(teacher_id):
     return [dict(row) for row in rows]
 
 
+def create_manual_syllabus(teacher_id, title, created_at):
+    teacher_id = _lesson_teacher_id(teacher_id)
+    title = " ".join(str(title or "").split())[:160]
+    if not title:
+        raise ValueError("Enter a course name.")
+    fingerprint = hashlib.sha256((str(teacher_id) + ":manual:" + title.casefold()).encode("utf-8")).hexdigest()
+    with connect() as conn:
+        existing = conn.execute(
+            "SELECT id FROM syllabuses WHERE teacher_id = ? AND content_sha256 = ?",
+            (teacher_id, fingerprint),
+        ).fetchone()
+        if existing:
+            raise ValueError("A course with that name already exists. Open it from Courses & Lessons.")
+        cursor = conn.execute("""
+            INSERT INTO syllabuses (teacher_id, title, source_filename, content_sha256, created_at)
+            VALUES (?, ?, ?, ?, ?)
+        """, (teacher_id, title, "Created in ClassFlow", fingerprint, created_at))
+    return get_syllabus(cursor.lastrowid, teacher_id)
+
+
 def get_syllabus(syllabus_id, teacher_id):
     teacher_id = _lesson_teacher_id(teacher_id)
     with connect() as conn:
@@ -917,7 +959,7 @@ def link_syllabus_to_class(confirmation_id, syllabus_id, teacher_id, linked_at):
     with connect() as conn:
         conn.execute("BEGIN IMMEDIATE")
         class_row = conn.execute("""
-            SELECT c.id FROM confirmations c
+            SELECT c.id, c.course FROM confirmations c
             WHERE c.id = ? AND NOT EXISTS (
                 SELECT 1 FROM makeup_obligations m
                 WHERE m.session_id = c.session_id AND m.original_date = c.class_date
@@ -935,7 +977,23 @@ def link_syllabus_to_class(confirmation_id, syllabus_id, teacher_id, linked_at):
                 (confirmation_id, syllabus_id, teacher_id, linked_at)
             VALUES (?, ?, ?, ?)
         """, (int(confirmation_id), int(syllabus_id), teacher_id, linked_at))
+        conn.execute("""
+            INSERT INTO course_syllabus_defaults (teacher_id, course_name, syllabus_id)
+            VALUES (?, ?, ?)
+            ON CONFLICT(teacher_id, course_name) DO UPDATE SET syllabus_id = excluded.syllabus_id
+        """, (teacher_id, class_row["course"], int(syllabus_id)))
     return True
+
+
+def get_course_syllabus_default(course_name, teacher_id):
+    teacher_id = _lesson_teacher_id(teacher_id)
+    with connect() as conn:
+        row = conn.execute("""
+            SELECT s.id FROM course_syllabus_defaults d
+            JOIN syllabuses s ON s.id = d.syllabus_id AND s.teacher_id = d.teacher_id
+            WHERE d.teacher_id = ? AND d.course_name = ? COLLATE NOCASE
+        """, (teacher_id, str(course_name or "").strip())).fetchone()
+    return int(row["id"]) if row else None
 
 
 def get_syllabus_chapters(syllabus_id, teacher_id):
@@ -944,10 +1002,150 @@ def get_syllabus_chapters(syllabus_id, teacher_id):
         return []
     with connect() as conn:
         rows = conn.execute("""
-            SELECT id, syllabus_id, position, title
-            FROM syllabus_chapters WHERE syllabus_id = ? ORDER BY position, id
+            SELECT c.id, c.syllabus_id, c.position, c.title,
+                   c.material_file_id, c.material_filename, c.material_mime_type,
+                   c.material_uploaded_at,
+                   (SELECT COUNT(*) FROM syllabus_topics t WHERE t.chapter_id = c.id) AS topic_count
+            FROM syllabus_chapters c WHERE c.syllabus_id = ? ORDER BY c.position, c.id
         """, (int(syllabus_id),)).fetchall()
     return [dict(row) for row in rows]
+
+
+def get_syllabus_chapter_topics(syllabus_id, chapter_id, teacher_id):
+    teacher_id = _lesson_teacher_id(teacher_id)
+    with connect() as conn:
+        rows = conn.execute("""
+            SELECT t.id, t.parent_topic_id, t.position, t.title
+            FROM syllabus_topics t
+            JOIN syllabus_chapters c ON c.id = t.chapter_id
+            JOIN syllabuses s ON s.id = c.syllabus_id
+            WHERE c.id = ? AND c.syllabus_id = ? AND s.teacher_id = ?
+            ORDER BY t.parent_topic_id IS NOT NULL, t.parent_topic_id, t.position, t.id
+        """, (int(chapter_id), int(syllabus_id), teacher_id)).fetchall()
+    return [dict(row) for row in rows]
+
+
+def add_syllabus_chapter(syllabus_id, teacher_id, title):
+    teacher_id = _lesson_teacher_id(teacher_id)
+    title = " ".join(str(title or "").split())[:160]
+    if not title:
+        raise ValueError("Enter a chapter title.")
+    with connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        if not conn.execute("SELECT 1 FROM syllabuses WHERE id = ? AND teacher_id = ?",
+                            (int(syllabus_id), teacher_id)).fetchone():
+            raise ValueError("That course could not be found.")
+        position = conn.execute(
+            "SELECT COALESCE(MAX(position), -1) + 1 FROM syllabus_chapters WHERE syllabus_id = ?",
+            (int(syllabus_id),),
+        ).fetchone()[0]
+        cursor = conn.execute(
+            "INSERT INTO syllabus_chapters (syllabus_id, position, title) VALUES (?, ?, ?)",
+            (int(syllabus_id), position, title),
+        )
+        chapter_id = cursor.lastrowid
+    return chapter_id
+
+
+def add_syllabus_topics(syllabus_id, chapter_id, teacher_id, titles):
+    teacher_id = _lesson_teacher_id(teacher_id)
+    normalized = [" ".join(str(title or "").split())[:240] for title in titles]
+    normalized = [title for title in normalized if title]
+    if not normalized:
+        raise ValueError("Enter at least one topic, one per line.")
+    with connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        chapter = conn.execute("""
+            SELECT c.id FROM syllabus_chapters c
+            JOIN syllabuses s ON s.id = c.syllabus_id
+            WHERE c.id = ? AND c.syllabus_id = ? AND s.teacher_id = ?
+        """, (int(chapter_id), int(syllabus_id), teacher_id)).fetchone()
+        if not chapter:
+            raise ValueError("That chapter could not be found in this course.")
+        position = conn.execute(
+            "SELECT COALESCE(MAX(position), -1) + 1 FROM syllabus_topics WHERE chapter_id = ? AND parent_topic_id IS NULL",
+            (int(chapter_id),),
+        ).fetchone()[0]
+        conn.executemany("""
+            INSERT INTO syllabus_topics (chapter_id, parent_topic_id, position, title)
+            VALUES (?, NULL, ?, ?)
+        """, [(int(chapter_id), position + index, title) for index, title in enumerate(normalized)])
+    return len(normalized)
+
+
+def rename_syllabus_chapter(syllabus_id, chapter_id, teacher_id, title):
+    teacher_id = _lesson_teacher_id(teacher_id)
+    title = " ".join(str(title or "").split())[:160]
+    if not title:
+        raise ValueError("Enter a chapter title.")
+    with connect() as conn:
+        cursor = conn.execute("""
+            UPDATE syllabus_chapters SET title = ?
+            WHERE id = ? AND syllabus_id = ? AND EXISTS (
+                SELECT 1 FROM syllabuses s WHERE s.id = syllabus_chapters.syllabus_id AND s.teacher_id = ?
+            )
+        """, (title, int(chapter_id), int(syllabus_id), teacher_id))
+    return cursor.rowcount == 1
+
+
+def rename_syllabus_topic(syllabus_id, chapter_id, topic_id, teacher_id, title):
+    teacher_id = _lesson_teacher_id(teacher_id)
+    title = " ".join(str(title or "").split())[:240]
+    if not title:
+        raise ValueError("Enter a topic title.")
+    with connect() as conn:
+        cursor = conn.execute("""
+            UPDATE syllabus_topics SET title = ?
+            WHERE id = ? AND chapter_id = ? AND EXISTS (
+                SELECT 1 FROM syllabus_chapters c
+                JOIN syllabuses s ON s.id = c.syllabus_id
+                WHERE c.id = syllabus_topics.chapter_id AND c.id = ?
+                  AND c.syllabus_id = ? AND s.teacher_id = ?
+            )
+        """, (title, int(topic_id), int(chapter_id), int(chapter_id), int(syllabus_id), teacher_id))
+    return cursor.rowcount == 1
+
+
+def attach_syllabus_chapter_material(syllabus_id, chapter_id, teacher_id, file_id,
+                                     filename, mime_type, uploaded_at):
+    teacher_id = _lesson_teacher_id(teacher_id)
+    if not str(file_id or "").strip():
+        raise ValueError("Telegram did not provide a reusable file identifier.")
+    filename = " ".join(str(filename or "").split())[:180]
+    mime_type = str(mime_type or "application/octet-stream").split(";", 1)[0].strip().lower()
+    with connect() as conn:
+        cursor = conn.execute("""
+            UPDATE syllabus_chapters SET material_file_id = ?, material_filename = ?,
+                material_mime_type = ?, material_uploaded_at = ?
+            WHERE id = ? AND syllabus_id = ? AND EXISTS (
+                SELECT 1 FROM syllabuses s WHERE s.id = syllabus_chapters.syllabus_id AND s.teacher_id = ?
+            )
+        """, (str(file_id), filename, mime_type, uploaded_at,
+              int(chapter_id), int(syllabus_id), teacher_id))
+    return cursor.rowcount == 1
+
+
+def copy_teacher_chapter_material_to_syllabus(legacy_chapter_id, syllabus_id,
+                                               syllabus_chapter_id, teacher_id):
+    teacher_id = _lesson_teacher_id(teacher_id)
+    with connect() as conn:
+        row = conn.execute("""
+            SELECT m.file_id, m.filename, m.mime_type FROM chapter_materials m
+            JOIN teacher_chapters tc ON tc.id = m.chapter_id AND tc.teacher_id = m.teacher_id
+            JOIN syllabus_chapters sc ON sc.id = ? AND sc.syllabus_id = ?
+            JOIN syllabuses s ON s.id = sc.syllabus_id AND s.teacher_id = ?
+            WHERE tc.id = ? AND tc.teacher_id = ?
+        """, (int(syllabus_chapter_id), int(syllabus_id), teacher_id,
+              int(legacy_chapter_id), teacher_id)).fetchone()
+        if not row:
+            return False
+        cursor = conn.execute("""
+            UPDATE syllabus_chapters SET material_file_id = ?, material_filename = ?,
+                material_mime_type = ?, material_uploaded_at = CURRENT_TIMESTAMP
+            WHERE id = ? AND syllabus_id = ?
+        """, (row["file_id"], row["filename"], row["mime_type"],
+              int(syllabus_chapter_id), int(syllabus_id)))
+    return cursor.rowcount == 1
 
 
 def get_class_syllabus_topics(confirmation_id, syllabus_id, teacher_id):

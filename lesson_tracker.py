@@ -147,6 +147,36 @@ async def handle_document_upload(update, context, teacher_id, timezone, max_uplo
     if not chat or chat.type != "private":
         await message.reply_text("💬 Please upload teaching materials in a private chat with ClassFlow.")
         return
+    material_target = context.user_data.get("course_material_upload")
+    if material_target:
+        if chat.id != material_target.get("chat_id"):
+            await message.reply_text("💬 Upload this file in the same private chat where you selected the course chapter.")
+            return
+        document = message.document
+        if document.file_size is None or document.file_size > max_upload_bytes:
+            await message.reply_text(f"⚠️ Upload a document under {max_upload_bytes // (1024 * 1024)} MB.")
+            return
+        filename = Path((document.file_name or "teaching-material").replace("\\", "/")).name
+        filename = "".join(char for char in filename if char.isprintable() and char not in "\r\n")[:180] or "teaching-material"
+        mime_type = (document.mime_type or "application/octet-stream").split(";", 1)[0].strip().lower()
+        try:
+            saved = database.attach_syllabus_chapter_material(
+                material_target["syllabus_id"], material_target["chapter_id"], teacher_id,
+                document.file_id, filename, mime_type, _now(timezone),
+            )
+            if not saved:
+                raise ValueError("That chapter is no longer available in this course.")
+        except ValueError as exc:
+            context.user_data.pop("course_material_upload", None)
+            await message.reply_text(f"⚠️ {exc}")
+            return
+        context.user_data.pop("course_material_upload", None)
+        text, markup = _course_chapter_view(
+            material_target["syllabus_id"], material_target["chapter_id"], teacher_id
+        )
+        await message.reply_text(f"✅ {filename} is attached to this course chapter.")
+        await message.reply_text(text, reply_markup=markup)
+        return
     context.user_data.pop("syllabus_edit", None)
     context.user_data.pop("lesson_note", None)
 
@@ -280,20 +310,29 @@ def _lesson_classes_view(teacher_id, timezone, page):
     if nav:
         rows.append(nav)
     rows.extend([
-        [InlineKeyboardButton("📚 Syllabus Library", callback_data="lesson:library:0")],
+        [InlineKeyboardButton("📚 Courses & Lessons", callback_data="lesson:library:0")],
         [InlineKeyboardButton("🏠 Main Menu", callback_data="makeup:home")],
     ])
     return "\n".join(lines), InlineKeyboardMarkup(rows)
 
 
-def _class_view(confirmation_id, teacher_id):
+def _class_view(confirmation_id, teacher_id, timezone):
     item = database.get_lesson_class(confirmation_id, teacher_id)
     if not item:
         return "⚠️ That class is unavailable or was cancelled.", InlineKeyboardMarkup([
-            [InlineKeyboardButton("📖 Lesson Tracker", callback_data="lesson:classes:0")],
+            [InlineKeyboardButton("📖 Lessons", callback_data="lesson:classes:0")],
         ])
     sections = ", ".join(item["sections"].split(","))
     syllabuses = database.get_class_syllabuses(confirmation_id, teacher_id)
+    if not syllabuses:
+        default_syllabus_id = database.get_course_syllabus_default(item["course"], teacher_id)
+        if not default_syllabus_id:
+            available_syllabuses = database.list_syllabuses(teacher_id)
+            if len(available_syllabuses) == 1:
+                default_syllabus_id = available_syllabuses[0]["id"]
+        if default_syllabus_id:
+            database.link_syllabus_to_class(confirmation_id, default_syllabus_id, teacher_id, _now(timezone))
+            syllabuses = database.get_class_syllabuses(confirmation_id, teacher_id)
     assignments = database.get_class_topic_assignments(confirmation_id, teacher_id)
     rows = []
     for syllabus in syllabuses:
@@ -386,6 +425,8 @@ def _topic_selector(confirmation_id, syllabus_id, teacher_id, chapter_page, expa
         is_open = int(expanded_chapter_id or 0) == chapter["id"]
         icon = "📂" if is_open else "📁"
         lines.append(f"{icon} {chapter['title']}")
+        if chapter.get("material_file_id"):
+            lines.append(f"　📎 Material: {chapter['material_filename']}")
         buttons.append([InlineKeyboardButton(
             f"{icon} {_short(chapter['title'], 42)}",
             callback_data=(f"lesson:topics:{confirmation_id}:{syllabus_id}:0:{chapter_page}:0" if is_open
@@ -393,6 +434,11 @@ def _topic_selector(confirmation_id, syllabus_id, teacher_id, chapter_page, expa
         )])
         if not is_open:
             continue
+        if chapter.get("material_file_id"):
+            buttons.append([InlineKeyboardButton(
+                "📥 Send Chapter Material",
+                callback_data=f"lesson:sendmaterial:{syllabus_id}:{chapter['id']}"
+            )])
         tree = _topic_tree(by_chapter.get(chapter["id"], []))
         flat = _flatten_topics(tree)
         max_topic_page = max(0, (len(flat) - 1) // TOPIC_PAGE_SIZE)
@@ -402,7 +448,7 @@ def _topic_selector(confirmation_id, syllabus_id, teacher_id, chapter_page, expa
         selected_leaves = sum(bool(node["status"]) for node in leaves)
         if leaves:
             target = "0" if selected_leaves == len(leaves) else "1"
-            label = "🧹 Clear Chapter" if target == "0" else "✅ Select All Subtopics"
+            label = "🧹 Clear Chapter" if target == "0" else "✅ Plan Entire Chapter"
             buttons.append([InlineKeyboardButton(
                 label, callback_data=f"lesson:all:{confirmation_id}:{syllabus_id}:{chapter['id']}:{target}:{chapter_page}:{topic_page}"
             )])
@@ -440,7 +486,7 @@ def _topic_selector(confirmation_id, syllabus_id, teacher_id, chapter_page, expa
         buttons.append(nav_chapters)
     buttons.extend([
         [InlineKeyboardButton("📋 Teaching Progress", callback_data=f"lesson:progressclass:{confirmation_id}:0")],
-        [InlineKeyboardButton("📊 Syllabus Progress", callback_data=f"lesson:progress:{syllabus_id}")],
+        [InlineKeyboardButton("📊 Course Progress", callback_data=f"lesson:progress:{syllabus_id}")],
         [InlineKeyboardButton("⬅️ Back to Class", callback_data=f"lesson:class:{confirmation_id}")],
     ])
     return "\n".join(lines), InlineKeyboardMarkup(buttons)
@@ -492,14 +538,19 @@ def _syllabus_library(teacher_id, page):
     page = max(0, int(page))
     start = page * CLASS_PAGE_SIZE
     visible = items[start:start + CLASS_PAGE_SIZE]
-    lines = ["📚 Syllabus Library", "Choose a syllabus to see unique-topic progress.", ""]
+    lines = [
+        "📚 Courses & Lessons",
+        "Open a course to manage chapters, files, topics, and progress.",
+        "Send a complete syllabus document to import it, or create a course and add chapters one at a time.",
+        "",
+    ]
     rows = []
     if not items:
-        lines.append("No syllabuses have been confirmed yet. Upload a PDF, DOCX, or PPTX in this private chat.")
+        lines.append("No courses yet. Send a syllabus PDF, DOCX, or PPTX here to set one up.")
     for item in visible:
         rows.append([InlineKeyboardButton(
             f"📘 {_short(item['title'], 38)} · {item['topic_count']} topics",
-            callback_data=f"lesson:progress:{item['id']}"
+            callback_data=f"lesson:course:{item['id']}"
         )])
     nav = []
     if page > 0:
@@ -509,9 +560,103 @@ def _syllabus_library(teacher_id, page):
     if nav:
         rows.append(nav)
     rows.extend([
-        [InlineKeyboardButton("📖 Lesson Tracker", callback_data="lesson:classes:0")],
+        [InlineKeyboardButton("➕ Create a Course", callback_data="lesson:newcourse")],
+        [InlineKeyboardButton("🗓️ Upcoming & Recent Lessons", callback_data="lesson:classes:0")],
+        [InlineKeyboardButton("📂 Existing Chapter Files", callback_data="chapter:list:0")],
         [InlineKeyboardButton("🏠 Main Menu", callback_data="makeup:home")],
     ])
+    return "\n".join(lines), InlineKeyboardMarkup(rows)
+
+
+def _course_view(syllabus_id, teacher_id):
+    syllabus = database.get_syllabus(syllabus_id, teacher_id)
+    if not syllabus:
+        return "⚠️ That course could not be found.", InlineKeyboardMarkup([
+            [InlineKeyboardButton("⬅️ Courses", callback_data="lesson:library:0")],
+        ])
+    chapters = database.get_syllabus_chapters(syllabus_id, teacher_id)
+    lines = [f"📘 {syllabus['title']}", "Manage course chapters, materials, and topics here.", ""]
+    rows = []
+    if not chapters:
+        lines.append("No chapters yet. Add a chapter below or import a syllabus document.")
+    for chapter in chapters:
+        material = "📎" if chapter["material_file_id"] else "📄"
+        lines.append(f"{material} {chapter['title']} · {chapter['topic_count']} topics")
+        rows.append([InlineKeyboardButton(
+            f"{material} {_short(chapter['title'], 38)} · {chapter['topic_count']} topics",
+            callback_data=f"lesson:chapter:{syllabus_id}:{chapter['id']}"
+        )])
+    rows.extend([
+        [InlineKeyboardButton("➕ Add Chapter", callback_data=f"lesson:addchapter:{syllabus_id}")],
+        [InlineKeyboardButton("📊 Course Progress", callback_data=f"lesson:progress:{syllabus_id}")],
+        [InlineKeyboardButton("🗓️ Lessons", callback_data="lesson:classes:0")],
+        [InlineKeyboardButton("⬅️ All Courses", callback_data="lesson:library:0")],
+    ])
+    return "\n".join(lines), InlineKeyboardMarkup(rows)
+
+
+def _course_chapter_view(syllabus_id, chapter_id, teacher_id):
+    syllabus = database.get_syllabus(syllabus_id, teacher_id)
+    chapter = next((item for item in database.get_syllabus_chapters(syllabus_id, teacher_id)
+                    if item["id"] == int(chapter_id)), None)
+    if not syllabus or not chapter:
+        return "⚠️ That chapter could not be found in this course.", InlineKeyboardMarkup([
+            [InlineKeyboardButton("⬅️ Back to Course", callback_data=f"lesson:course:{syllabus_id}")],
+        ])
+    rows = [[InlineKeyboardButton("➕ Add Topics", callback_data=f"lesson:addtopics:{syllabus_id}:{chapter_id}")],
+            [InlineKeyboardButton("✏️ Rename Chapter", callback_data=f"lesson:renamechapter:{syllabus_id}:{chapter_id}")]]
+    if chapter["material_file_id"]:
+        text = (f"📘 {syllabus['title']}\n📖 {chapter['title']}\n\n"
+                f"📎 Material: {chapter['material_filename']}\n"
+                f"🗂️ Type: {chapter['material_mime_type']}\n\n")
+        rows.extend([
+            [InlineKeyboardButton("📥 Send Material", callback_data=f"lesson:sendmaterial:{syllabus_id}:{chapter_id}")],
+            [InlineKeyboardButton("♻️ Replace Material", callback_data=f"lesson:uploadmaterial:{syllabus_id}:{chapter_id}")],
+        ])
+    else:
+        text = f"📘 {syllabus['title']}\n📖 {chapter['title']}\n\n📎 No material attached yet.\n\n"
+        rows.append([InlineKeyboardButton("📎 Attach Material", callback_data=f"lesson:uploadmaterial:{syllabus_id}:{chapter_id}")])
+    rows.append([InlineKeyboardButton("🔗 Use a Previously Uploaded File", callback_data=f"lesson:legacyfiles:{syllabus_id}:{chapter_id}:0")])
+    topics = database.get_syllabus_chapter_topics(syllabus_id, chapter_id, teacher_id)
+    text += f"📝 Topics ({len(topics)}):\n"
+    text += "\n".join(f"• {item['title']}" for item in topics) if topics else "No topics yet. Add them below, one per line."
+    for topic in topics:
+        rows.append([InlineKeyboardButton(
+            f"✏️ {_short(topic['title'], 42)}",
+            callback_data=f"lesson:renametopic:{syllabus_id}:{chapter_id}:{topic['id']}"
+        )])
+    rows.extend([
+        [InlineKeyboardButton("⬅️ Back to Course", callback_data=f"lesson:course:{syllabus_id}")],
+        [InlineKeyboardButton("🏠 Main Menu", callback_data="makeup:home")],
+    ])
+    return text, InlineKeyboardMarkup(rows)
+
+
+def _legacy_materials_view(syllabus_id, chapter_id, teacher_id, page):
+    result = database.list_teacher_chapters(teacher_id, limit=50, offset=0)
+    items = [item for item in result["items"] if item["material_attached"]]
+    page_size = 8
+    page_count = max(1, (len(items) + page_size - 1) // page_size)
+    page = min(max(0, int(page)), page_count - 1)
+    visible = items[page * page_size:(page + 1) * page_size]
+    lines = ["📂 Link a previously uploaded file", "Choose the file to attach to this course chapter.", ""]
+    rows = []
+    if not visible:
+        lines.append("No previously uploaded chapter files were found.")
+    for item in visible:
+        lines.append(f"📎 {item['name']} · {item['filename']}")
+        rows.append([InlineKeyboardButton(
+            f"📎 {_short(item['name'], 24)} · {_short(item['filename'], 24)}",
+            callback_data=f"lesson:importfile:{syllabus_id}:{chapter_id}:{item['id']}"
+        )])
+    nav = []
+    if page:
+        nav.append(InlineKeyboardButton("⬅️ Previous", callback_data=f"lesson:legacyfiles:{syllabus_id}:{chapter_id}:{page - 1}"))
+    if (page + 1) * page_size < len(items):
+        nav.append(InlineKeyboardButton("Next ➡️", callback_data=f"lesson:legacyfiles:{syllabus_id}:{chapter_id}:{page + 1}"))
+    if nav:
+        rows.append(nav)
+    rows.append([InlineKeyboardButton("⬅️ Back to Course", callback_data=f"lesson:course:{syllabus_id}")])
     return "\n".join(lines), InlineKeyboardMarkup(rows)
 
 
@@ -524,12 +669,13 @@ async def handle_text_input(update, context, teacher_id, timezone):
     if not update.effective_chat or update.effective_chat.type != "private":
         return False
     edit = context.user_data.get("syllabus_edit")
+    course_edit = context.user_data.get("course_edit")
     note = context.user_data.get("lesson_note")
-    if not edit and not note:
+    if not edit and not course_edit and not note:
         return False
     text = message.text.strip()
-    if len(text) > 500:
-        await message.reply_text("⚠️ Keep the text to 500 characters or fewer.")
+    if len(text) > (4000 if course_edit and course_edit["action"] == "addtopics" else 500):
+        await message.reply_text("⚠️ Keep the text within the message limit and try again.")
         return True
     try:
         if edit:
@@ -553,6 +699,47 @@ async def handle_text_input(update, context, teacher_id, timezone):
                     )
                 else:
                     await message.reply_text(view[0], reply_markup=view[1])
+            return True
+        if course_edit:
+            if course_edit["action"] == "newcourse":
+                saved_course = database.create_manual_syllabus(teacher_id, text, _now(timezone))
+                reply = "✅ Course created. Add its chapters and materials here."
+            elif course_edit["action"] == "addchapter":
+                database.add_syllabus_chapter(course_edit["syllabus_id"], teacher_id, text)
+                reply = "✅ Chapter added."
+            elif course_edit["action"] == "renamechapter":
+                if not database.rename_syllabus_chapter(
+                    course_edit["syllabus_id"], course_edit["chapter_id"], teacher_id, text
+                ):
+                    raise ValueError("That chapter could not be found.")
+                reply = "✅ Chapter renamed."
+            elif course_edit["action"] == "renametopic":
+                if not database.rename_syllabus_topic(
+                    course_edit["syllabus_id"], course_edit["chapter_id"],
+                    course_edit["topic_id"], teacher_id, text,
+                ):
+                    raise ValueError("That topic could not be found.")
+                reply = "✅ Topic renamed."
+            else:
+                count = database.add_syllabus_topics(
+                    course_edit["syllabus_id"], course_edit["chapter_id"], teacher_id,
+                    [line.strip(" •\t") for line in text.splitlines() if line.strip(" •\t")],
+                )
+                reply = f"✅ Added {count} topic(s)."
+            context.user_data.pop("course_edit", None)
+            if course_edit["action"] == "newcourse":
+                view, markup = _course_view(saved_course["id"], teacher_id)
+            elif course_edit["action"] == "addchapter":
+                view, markup = _course_view(course_edit["syllabus_id"], teacher_id)
+            else:
+                view, markup = _course_chapter_view(
+                    course_edit["syllabus_id"], course_edit["chapter_id"], teacher_id
+                )
+            await context.bot.edit_message_text(
+                chat_id=course_edit["chat_id"], message_id=course_edit["message_id"],
+                text=view, reply_markup=markup,
+            )
+            await message.reply_text(reply)
             return True
         if note:
             database.set_class_topic_note(
@@ -663,6 +850,8 @@ async def handle_callback(query, context, teacher_id, timezone):
     parts = data.split(":")
     action = parts[1]
     context.user_data.pop("syllabus_edit", None)
+    context.user_data.pop("course_edit", None)
+    context.user_data.pop("course_material_upload", None)
     if action != "note":
         context.user_data.pop("lesson_note", None)
     if action == "skip":
@@ -702,7 +891,18 @@ async def handle_callback(query, context, teacher_id, timezone):
                 ]),
             )
             return True
-        text, markup = _syllabus_choices(confirmation_id, teacher_id, 0)
+        linked_syllabuses = database.get_class_syllabuses(confirmation_id, teacher_id)
+        syllabus_id = linked_syllabuses[0]["id"] if linked_syllabuses else None
+        if not syllabus_id:
+            syllabus_id = database.get_course_syllabus_default(confirmed["course"], teacher_id) if confirmed else None
+        available_syllabuses = database.list_syllabuses(teacher_id)
+        if not syllabus_id and len(available_syllabuses) == 1:
+            syllabus_id = available_syllabuses[0]["id"]
+        if syllabus_id:
+            database.link_syllabus_to_class(confirmation_id, syllabus_id, teacher_id, _now(timezone))
+            text, markup = _topic_selector(confirmation_id, syllabus_id, teacher_id, 0, 0, 0)
+        else:
+            text, markup = _syllabus_choices(confirmation_id, teacher_id, 0)
         await query.edit_message_text(text, reply_markup=markup)
         return True
     if action == "classes":
@@ -710,7 +910,7 @@ async def handle_callback(query, context, teacher_id, timezone):
         await query.edit_message_text(text, reply_markup=markup)
         return True
     if action == "class":
-        text, markup = _class_view(int(parts[2]), teacher_id)
+        text, markup = _class_view(int(parts[2]), teacher_id, timezone)
         await query.edit_message_text(text, reply_markup=markup)
         return True
     if action == "choose":
@@ -814,6 +1014,110 @@ async def handle_callback(query, context, teacher_id, timezone):
         text, markup = _syllabus_library(teacher_id, int(parts[2]))
         await query.edit_message_text(text, reply_markup=markup)
         return True
+    if action == "course":
+        text, markup = _course_view(int(parts[2]), teacher_id)
+        await query.edit_message_text(text, reply_markup=markup)
+        return True
+    if action == "chapter":
+        text, markup = _course_chapter_view(int(parts[2]), int(parts[3]), teacher_id)
+        await query.edit_message_text(text, reply_markup=markup)
+        return True
+    if action in {"newcourse", "addchapter", "addtopics", "renamechapter", "renametopic"}:
+        if action == "newcourse":
+            syllabus_id = None; chapter_id = None
+            prompt = "📘 Enter the course name (for example: System Analysis and Design):"
+        elif action == "addchapter":
+            syllabus_id = int(parts[2]); chapter_id = None
+            prompt = "➕ Send the chapter name:"
+        elif action == "addtopics":
+            syllabus_id, chapter_id = int(parts[2]), int(parts[3])
+            prompt = "📝 Send the topics for this chapter, one topic per line. You can paste several at once."
+        elif action == "renamechapter":
+            syllabus_id, chapter_id = int(parts[2]), int(parts[3])
+            prompt = "✏️ Send the new chapter name:"
+        else:
+            syllabus_id, chapter_id, topic_id = map(int, parts[2:5])
+            if not any(item["id"] == topic_id for item in database.get_syllabus_chapter_topics(
+                syllabus_id, chapter_id, teacher_id
+            )):
+                await query.edit_message_text("⚠️ That topic could not be found.")
+                return True
+            prompt = "✏️ Send the new topic name:"
+        if syllabus_id is not None and not database.get_syllabus(syllabus_id, teacher_id):
+            await query.edit_message_text("⚠️ That course could not be found.")
+            return True
+        if chapter_id is not None and not any(
+            item["id"] == chapter_id for item in database.get_syllabus_chapters(syllabus_id, teacher_id)
+        ):
+            await query.edit_message_text("⚠️ That chapter could not be found.")
+            return True
+        context.user_data["course_edit"] = {
+            "action": action, "syllabus_id": syllabus_id, "chapter_id": chapter_id,
+            "topic_id": topic_id if action == "renametopic" else None,
+            "chat_id": query.message.chat_id, "message_id": query.message.message_id,
+        }
+        await query.edit_message_text(prompt, reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("❌ Cancel", callback_data="lesson:library:0" if action == "newcourse"
+                                  else f"lesson:course:{syllabus_id}" if action == "addchapter"
+                                  else f"lesson:chapter:{syllabus_id}:{chapter_id}")],
+        ]))
+        return True
+    if action == "uploadmaterial":
+        syllabus_id, chapter_id = int(parts[2]), int(parts[3])
+        if not any(item["id"] == chapter_id for item in database.get_syllabus_chapters(syllabus_id, teacher_id)):
+            await query.edit_message_text("⚠️ That chapter could not be found in this course.")
+            return True
+        context.user_data["course_material_upload"] = {
+            "syllabus_id": syllabus_id, "chapter_id": chapter_id,
+            "chat_id": query.message.chat_id,
+        }
+        await query.edit_message_text(
+            "📎 Send the material for this chapter as a document. Any document type is accepted. "
+            "It will be saved with the chapter and shown beside its topics.",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("❌ Cancel", callback_data=f"lesson:chapter:{syllabus_id}:{chapter_id}")],
+            ]),
+        )
+        return True
+    if action == "sendmaterial":
+        syllabus_id, chapter_id = int(parts[2]), int(parts[3])
+        chapter = next((item for item in database.get_syllabus_chapters(syllabus_id, teacher_id)
+                        if item["id"] == chapter_id), None)
+        if not chapter or not chapter["material_file_id"]:
+            await query.edit_message_text("⚠️ There is no material attached to this chapter.")
+            return True
+        try:
+            await context.bot.send_document(
+                chat_id=query.message.chat_id, document=chapter["material_file_id"],
+                filename=chapter["material_filename"], caption=f"📚 {chapter['title']} teaching material",
+            )
+        except TelegramError:
+            await query.edit_message_text(
+                "⚠️ Telegram couldn't retrieve that file. Upload it again to replace the attachment.",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("♻️ Replace Material", callback_data=f"lesson:uploadmaterial:{syllabus_id}:{chapter_id}")],
+                    [InlineKeyboardButton("⬅️ Back", callback_data=f"lesson:chapter:{syllabus_id}:{chapter_id}")],
+                ]),
+            )
+            return True
+        text, markup = _course_chapter_view(syllabus_id, chapter_id, teacher_id)
+        await query.edit_message_text(text, reply_markup=markup)
+        return True
+    if action == "legacyfiles":
+        syllabus_id, chapter_id, page = map(int, parts[2:5])
+        text, markup = _legacy_materials_view(syllabus_id, chapter_id, teacher_id, page)
+        await query.edit_message_text(text, reply_markup=markup)
+        return True
+    if action == "importfile":
+        syllabus_id, chapter_id, legacy_id = map(int, parts[2:5])
+        if not database.copy_teacher_chapter_material_to_syllabus(
+            legacy_id, syllabus_id, chapter_id, teacher_id
+        ):
+            await query.edit_message_text("⚠️ That saved file could not be linked. Check that it still exists.")
+            return True
+        text, markup = _course_chapter_view(syllabus_id, chapter_id, teacher_id)
+        await query.edit_message_text("✅ Existing file linked to the course chapter.\n\n" + text, reply_markup=markup)
+        return True
     if action == "progress":
         syllabus_id = int(parts[2])
         syllabus = database.get_syllabus(syllabus_id, teacher_id)
@@ -825,7 +1129,7 @@ async def handle_callback(query, context, teacher_id, timezone):
         filled = round(progress["percent_complete"] * width / 100)
         bar = "🟩" * filled + "⬜" * (width - filled)
         await query.edit_message_text(
-            f"📊 Syllabus Progress · {syllabus['title']}\n"
+            f"📊 Course Progress · {syllabus['title']}\n"
             f"📚 Unique topics: {progress['total_topics']}\n"
             f"✅ Completed: {progress['completed_topics']}\n"
             f"🟡 Partially covered: {progress['partially_covered_topics']}\n"
@@ -833,8 +1137,8 @@ async def handle_callback(query, context, teacher_id, timezone):
             f"⏳ Remaining: {progress['remaining_topics']}\n"
             f"📈 Complete: {progress['percent_complete']:.1f}%\n{bar}",
             reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("📖 Lesson Tracker", callback_data="lesson:classes:0")],
-                [InlineKeyboardButton("📚 Syllabus Library", callback_data="lesson:library:0")],
+                [InlineKeyboardButton("📖 Lessons", callback_data="lesson:classes:0")],
+                [InlineKeyboardButton("📚 Courses & Lessons", callback_data="lesson:library:0")],
                 [InlineKeyboardButton("🏠 Main Menu", callback_data="makeup:home")],
             ])
         )
