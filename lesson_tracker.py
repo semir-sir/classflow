@@ -676,8 +676,31 @@ async def handle_callback(query, context, teacher_id, timezone):
         return True
     if action == "prepare":
         confirmation_id = int(parts[2])
+        confirmed = database.get_confirmation_by_id(confirmation_id)
+        if confirmed:
+            timezone_info = ZoneInfo(timezone)
+            class_end = datetime.strptime(
+                f"{confirmed['class_date']} {confirmed['end']}", "%Y-%m-%d %H:%M"
+            ).replace(tzinfo=timezone_info)
+            if class_end <= datetime.now(timezone_info):
+                await query.edit_message_text(
+                    f"⏰ This class ended on {confirmed['class_date']} at {confirmed['end']}. "
+                    "Lesson preparation is closed for a class that has already passed. "
+                    "You can still use the Lesson Tracker to record what was covered.",
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton("📖 Open Lesson Tracker", callback_data="lesson:classes:0")],
+                        [InlineKeyboardButton("🏠 Main Menu", callback_data="makeup:home")],
+                    ]),
+                )
+                return True
         if not database.get_lesson_class(confirmation_id, teacher_id):
-            await query.edit_message_text("⚠️ That confirmed class is unavailable or cancelled.")
+            await query.edit_message_text(
+                "⚠️ This class is marked as cancelled, so lesson preparation is unavailable.",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🗓️ Makeup Obligations", callback_data="makeup:list")],
+                    [InlineKeyboardButton("🏠 Main Menu", callback_data="makeup:home")],
+                ]),
+            )
             return True
         text, markup = _syllabus_choices(confirmation_id, teacher_id, 0)
         await query.edit_message_text(text, reply_markup=markup)

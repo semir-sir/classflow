@@ -358,6 +358,24 @@ class LessonPrepTests(unittest.TestCase):
             lesson["id"], syllabus["id"], topic["id"], TEACHER_ID, "2026-10-28T12:01:00+03:00"
         ))
 
+    def test_old_prepare_button_explains_passed_date_and_keeps_progress_tracker_available(self):
+        lesson = self.make_class(date="2026-10-27", session="sad-tue")
+
+        class FrozenDateTime(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return cls(2026, 11, 2, 12, 0, tzinfo=tz)
+
+        query = FakeQuery(f"lesson:prepare:{lesson['id']}")
+        with patch("lesson_tracker.datetime", FrozenDateTime):
+            handled = asyncio.run(handle_callback(query, SimpleNamespace(user_data={}), TEACHER_ID, TIMEZONE))
+        self.assertTrue(handled)
+        self.assertIn("class ended on 2026-10-27", query.text)
+        self.assertIn("already passed", query.text)
+        callbacks = [button.callback_data for row in query.reply_markup.inline_keyboard for button in row]
+        self.assertIn("lesson:classes:0", callbacks)
+        self.assertIsNotNone(database.get_lesson_class(lesson["id"], TEACHER_ID))
+
     def test_review_and_selector_paginate_large_outlines(self):
         outline = {
             "course_title": "Large Course",
