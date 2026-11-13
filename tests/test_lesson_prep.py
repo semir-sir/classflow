@@ -337,6 +337,42 @@ class LessonPrepTests(unittest.TestCase):
         asyncio.run(handle_callback(FakeQuery(complete_callback), context, TEACHER_ID, TIMEZONE))
         self.assertEqual(database.get_class_topic_assignments(lesson["id"], TEACHER_ID)[0]["status"], "Completed")
 
+    def test_track_progress_uses_section_date_and_read_only_history(self):
+        syllabus = self.activate_syllabus()
+        lesson = self.make_class()
+        database.link_syllabus_to_class(lesson["id"], syllabus["id"], TEACHER_ID, "2026-10-28T10:00:00+03:00")
+        context = SimpleNamespace(user_data={})
+
+        start = FakeQuery("track:start")
+        asyncio.run(handle_callback(start, context, TEACHER_ID, TIMEZONE))
+        self.assertIn("Section A", start.text)
+
+        section = FakeQuery("track:section:A")
+        asyncio.run(handle_callback(section, context, TEACHER_ID, TIMEZONE))
+        self.assertIn("Overall topic coverage: 0/4", section.text)
+
+        course = FakeQuery(f"track:course:A:{syllabus['id']}")
+        asyncio.run(handle_callback(course, context, TEACHER_ID, TIMEZONE))
+        chapter_id = database.get_syllabus_chapters(syllabus["id"], TEACHER_ID)[0]["id"]
+        topics_view = FakeQuery(f"track:topics:A:{syllabus['id']}:{chapter_id}:0")
+        asyncio.run(handle_callback(topics_view, context, TEACHER_ID, TIMEZONE))
+        topic_callback = next(
+            button.callback_data
+            for row in topics_view.reply_markup.inline_keyboard for button in row
+            if button.callback_data and button.callback_data.startswith("track:record:")
+        )
+        saved = FakeQuery(topic_callback)
+        asyncio.run(handle_callback(saved, context, TEACHER_ID, TIMEZONE))
+        self.assertIn("Progress saved for Section A on 2026-10-28", saved.text)
+        report = database.get_section_chapter_progress(TEACHER_ID, "A")
+        self.assertEqual(report["covered_topics"], 1)
+        self.assertEqual(report["chapters"][0]["teaching_date"], "2026-10-28")
+
+        history = FakeQuery("track:history:A:0")
+        asyncio.run(handle_callback(history, context, TEACHER_ID, TIMEZONE))
+        self.assertIn("2026-10-28", history.text)
+        self.assertIn("Up to", history.text)
+
     def test_topic_assignments_persist_and_cancelled_class_is_not_editable(self):
         syllabus = self.activate_syllabus()
         lesson = self.make_class()

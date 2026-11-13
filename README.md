@@ -26,10 +26,12 @@ Group and private notifications are mocked in the tests. No test sends a real Te
 ## Credit analysis
 The teacher can select **Credit Check**, then Section A or Section B. The report compares the section's remaining balance with the 64.0-hour baseline, displays hours used and remaining, both percentages, a 20-cell used-hours bar, and active sessions logged. Active sessions count confirmed regular occurrences not recorded as cancelled plus makeup obligations marked Planned with a scheduled time or Completed. The calculation reads the existing SQLite balances and records; it does not change them.
 
-## Courses, materials, and lesson tracking
-The teacher opens **Courses & Lessons** to manage course outlines, chapter materials, topics, and course progress. A complete text-based PDF, DOCX, or PPTX can be imported and reviewed before confirmation. Alternatively, create a course manually, add chapters, add or rename topics, and attach any Telegram document type to each chapter. Existing files uploaded through the earlier Chapter Management menu can be linked to a course chapter without uploading them again. Course chapters, topic names, and attachment references are stored persistently in SQLite.
+## My Catalogue and Track Progress
+The main menu has two separate lesson tools. **My Catalogue** manages courses, chapters, documents, and topic lists. **Track Progress** starts by choosing Section A or B, then shows each chapter's current coverage and overall coverage using confirmed topic counts. Teachers can record the last topic covered or mark one or several chapters complete. Teaching dates use the only matching confirmed lesson when there is one, ask the teacher to choose when several match, and use the local current date when no matching session exists. Every update is saved to a read-only Teaching History.
 
-From an upcoming confirmed class, choose **Prepare Lesson** and select topics, or choose **Plan Entire Chapter**. ClassFlow remembers the selected course for later occurrences of that same scheduled course. After class, update each selected topic as Planned, Partially covered, Completed, or Not covered, with an optional note. **Teaching Progress** describes one class; **Course Progress** summarizes unique topics across the course. Syllabuses, chapter materials, class links, topic assignments, statuses, and notes persist in SQLite.
+A complete text-based PDF, DOCX, or PPTX syllabus can be imported and reviewed before confirmation. Alternatively, create a course manually, add chapters, add or rename topics, and attach any Telegram document type to each course chapter. Existing files from the earlier Chapter Management screen can be linked without uploading them again. Each workspace receives ten default Chapter 1–10 entries, shown five per page; extra chapters can be added. Course chapters, topic names, and attachment references are stored persistently in SQLite.
+
+From an upcoming confirmed class, choose **Prepare Lesson** and select topics, or choose **Plan Entire Chapter**. ClassFlow remembers the selected course for later occurrences of that same scheduled course. Per-class lesson planning remains available under **Track Progress → Upcoming & Recent Lessons**. Cumulative section progress is separate from the topics planned for one class.
 
 PDF, DOCX, and PPTX parsing happens locally; no OCR or external AI service is used. Text in PowerPoint slide shapes is extracted, but text embedded only in slide images cannot be read. Scanned/image-only PDFs are reported as unreadable until OCR is added in a future feature. The default upload limit is 10 MB and can be changed with `SYLLABUS_MAX_UPLOAD_MB` (1–19 MB, kept below Telegram's current 20 MB bot-download limit). Install the project dependencies with `python -m pip install -r requirements.txt`, then restart the existing bot with `python bot.py`.
 
@@ -37,7 +39,12 @@ PDF, DOCX, and PPTX parsing happens locally; no OCR or external AI service is us
 
 Files attached before the course workflow remain in their existing SQLite records. Open **Courses & Lessons → course → chapter → Use a Previously Uploaded File** to link one of those files to the chapter. Linking copies its Telegram file reference and metadata; it leaves the original attachment intact. The earlier Chapter Management screen remains reachable from Courses & Lessons for reviewing those stored files.
 
-The SQLite update is additive: it adds per-course-chapter material metadata and a course-to-syllabus default link. Existing course outlines, topic assignments, class confirmations, balances, and stored Chapter Management attachments are preserved.
+The SQLite update is additive: it adds per-course-chapter material metadata, a course-to-syllabus default link, cumulative per-section chapter progress, and read-only teaching history. Existing course outlines, topic assignments, class confirmations, balances, and stored Chapter Management attachments are preserved. Removing a course chapter's material clears only its Telegram file reference; it does not delete topics or progress.
+
+## Multiple teacher workspaces
+`TEACHER_TELEGRAM_ID` remains the existing teacher and keeps the existing `data/classflow.sqlite3` database. Add other authorized numeric Telegram user IDs to `AUTHORIZED_TEACHER_IDS` as a comma-separated list. Each additional teacher needs one entry in the private `data/teacher_profiles.json` file, using the format in `data/teacher_profiles.example.json`. The entry supplies that teacher's timetable file, section group chat IDs, initial section credit pools, timezone, and optional makeup broadcast group. ClassFlow creates a separate `data/teachers/<telegram-id>.sqlite3` database for each one, so schedules, confirmations, balances, makeup records, catalogue content, and teaching history are isolated.
+
+Keep `data/teacher_profiles.json` and `data/teachers/` on the host and out of GitHub. The sample profile file is safe to commit; replace every placeholder in a private copy. An authorized ID without a profile cannot open the bot's teaching workspace. New teacher databases start with the configured initial balances; existing balances are never reset by restarts.
 
 ## Database migration
 At startup, `init_db()` creates the makeup tables if absent. For databases with the earlier confirmed-only schema, it rebuilds the two makeup tables to make `confirmation_id` optional and adds a unique `(session_id, original_date)` key. Existing obligations and group notification state are copied; confirmations and balances are preserved. The occurrence key prevents duplicate cancellation records even when no confirmation exists.
@@ -52,9 +59,9 @@ The starting balance is 64 hours per section, inserted only on first database in
 2. From the project folder, create a virtual environment (recommended): `py -m venv .venv`.
 3. Install dependencies: `.venv\\Scripts\\python.exe -m pip install -r requirements.txt`.
 4. Copy `.env.example` to `.env`: `Copy-Item .env.example .env`.
-5. Set `BOT_TOKEN` to a newly generated token in `.env`. Do not share the token in chat or commit `.env`.
-6. Set `TEACHER_TELEGRAM_ID` to the teacher's personal numeric Telegram user ID, and set `TELEGRAM_GROUP_ID_A` and `TELEGRAM_GROUP_ID_B` to the respective groups' numeric chat IDs. Add the bot to both groups and allow it to post messages.
-7. From the project folder, run `.venv\\Scripts\\python.exe bot.py` (Pterodactyl/Linux: `python bot.py`). `app.py` is also a supported entry point. Both initialize a main-thread asyncio loop before starting PTB polling.
+5. Set `BOT_TOKEN` and the existing teacher's numeric Telegram ID. Keep `.env` private.
+6. For the existing teacher, set `TELEGRAM_GROUP_ID_A` and `TELEGRAM_GROUP_ID_B`. For additional teachers, add their IDs to `AUTHORIZED_TEACHER_IDS`, copy `data/teacher_profiles.example.json` to `data/teacher_profiles.json`, and fill in a separate profile and timetable file for each. Add the bot to every configured group and allow it to post.
+7. From the project folder, run `.venv\\Scripts\\python.exe bot.py` (Pterodactyl/Linux: `python bot.py`). `app.py` is also supported. Keep teacher profile files, timetable files, and SQLite databases in persistent server storage.
 8. Run the test suite with `.venv\\Scripts\\python.exe -m unittest discover -s tests -v`.
 
 In Telegram, send `/start` to the bot.

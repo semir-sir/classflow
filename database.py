@@ -1,6 +1,7 @@
 import sqlite3
 import json
 import hashlib
+from contextvars import ContextVar
 from datetime import date, datetime, timedelta
 from contextlib import contextmanager
 from pathlib import Path
@@ -8,10 +9,23 @@ from pathlib import Path
 BASE_DIR = Path(__file__).resolve().parent
 DB_PATH = BASE_DIR / "data" / "classflow.sqlite3"
 DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+_ACTIVE_DB_PATH = ContextVar("classflow_active_db_path", default=None)
+
+
+@contextmanager
+def use_database(path):
+    """Route all database calls in this async task to one teacher's SQLite file."""
+    target = Path(path).resolve()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    token = _ACTIVE_DB_PATH.set(target)
+    try:
+        yield
+    finally:
+        _ACTIVE_DB_PATH.reset(token)
 
 @contextmanager
 def connect():
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(_ACTIVE_DB_PATH.get() or DB_PATH)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
     try:
@@ -247,6 +261,39 @@ def init_db(initial_balances=None):
         conn.execute("CREATE INDEX IF NOT EXISTS idx_syllabus_topics_chapter ON syllabus_topics(chapter_id, parent_topic_id, position)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_class_topic_status ON class_topic_assignments(topic_id, status)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_class_syllabuses_teacher ON class_syllabuses(teacher_id, confirmation_id)")
+        # Cumulative section progress is additive and remains separate from
+        # per-class topic planning and history.
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS section_chapter_progress (
+                teacher_id INTEGER NOT NULL,
+                section TEXT NOT NULL CHECK(section IN ('A','B')),
+                syllabus_id INTEGER NOT NULL REFERENCES syllabuses(id) ON DELETE CASCADE,
+                chapter_id INTEGER NOT NULL REFERENCES syllabus_chapters(id) ON DELETE CASCADE,
+                last_topic_id INTEGER REFERENCES syllabus_topics(id) ON DELETE SET NULL,
+                completed INTEGER NOT NULL DEFAULT 0 CHECK(completed IN (0,1)),
+                teaching_date TEXT NOT NULL,
+                confirmation_id INTEGER REFERENCES confirmations(id) ON DELETE SET NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (teacher_id, section, chapter_id)
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS teaching_progress_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                teacher_id INTEGER NOT NULL,
+                section TEXT NOT NULL CHECK(section IN ('A','B')),
+                syllabus_id INTEGER NOT NULL REFERENCES syllabuses(id) ON DELETE CASCADE,
+                chapter_id INTEGER NOT NULL REFERENCES syllabus_chapters(id) ON DELETE CASCADE,
+                topic_id INTEGER REFERENCES syllabus_topics(id) ON DELETE SET NULL,
+                completed INTEGER NOT NULL CHECK(completed IN (0,1)),
+                teaching_date TEXT NOT NULL,
+                confirmation_id INTEGER REFERENCES confirmations(id) ON DELETE SET NULL,
+                recorded_at TEXT NOT NULL,
+                UNIQUE (teacher_id, section, chapter_id, topic_id, completed, teaching_date)
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_section_progress_owner ON section_chapter_progress(teacher_id, section, syllabus_id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_teaching_history_owner ON teaching_progress_history(teacher_id, section, teaching_date DESC, id DESC)")
         conn.execute("""
             CREATE TABLE IF NOT EXISTS teacher_chapters (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1125,6 +1172,21 @@ def attach_syllabus_chapter_material(syllabus_id, chapter_id, teacher_id, file_i
     return cursor.rowcount == 1
 
 
+def remove_syllabus_chapter_material(syllabus_id, chapter_id, teacher_id):
+    """Remove only the saved Telegram attachment; topics and progress remain intact."""
+    teacher_id = _lesson_teacher_id(teacher_id)
+    with connect() as conn:
+        cursor = conn.execute("""
+            UPDATE syllabus_chapters SET material_file_id = NULL, material_filename = NULL,
+                material_mime_type = NULL, material_uploaded_at = NULL
+            WHERE id = ? AND syllabus_id = ? AND EXISTS (
+                SELECT 1 FROM syllabuses s
+                WHERE s.id = syllabus_chapters.syllabus_id AND s.teacher_id = ?
+            )
+        """, (int(chapter_id), int(syllabus_id), teacher_id))
+    return cursor.rowcount == 1
+
+
 def copy_teacher_chapter_material_to_syllabus(legacy_chapter_id, syllabus_id,
                                                syllabus_chapter_id, teacher_id):
     teacher_id = _lesson_teacher_id(teacher_id)
@@ -1399,23 +1461,265 @@ def get_syllabus_progress(syllabus_id, teacher_id):
     }
 
 
-DEFAULT_TEACHER_CHAPTERS = tuple(f"Chapter {number}" for number in range(1, 6))
+def get_section_chapter_progress(teacher_id, section):
+    """Return cumulative chapter/topic coverage for one teacher-owned section."""
+    teacher_id = _lesson_teacher_id(teacher_id)
+    if section not in {"A", "B"}:
+        raise ValueError("Section must be A or B.")
+    with connect() as conn:
+        rows = conn.execute("""
+            SELECT s.id AS syllabus_id, s.title AS syllabus_title,
+                   c.id AS chapter_id, c.title AS chapter_title,
+                   COUNT(t.id) AS topic_count,
+                   p.last_topic_id, p.completed, p.teaching_date,
+                   p.confirmation_id, p.updated_at
+            FROM syllabuses s
+            JOIN syllabus_chapters c ON c.syllabus_id = s.id
+            LEFT JOIN syllabus_topics t ON t.chapter_id = c.id
+            LEFT JOIN section_chapter_progress p
+              ON p.chapter_id = c.id AND p.syllabus_id = s.id
+             AND p.teacher_id = s.teacher_id AND p.section = ?
+            WHERE s.teacher_id = ?
+            GROUP BY s.id, c.id, p.last_topic_id, p.completed,
+                     p.teaching_date, p.confirmation_id, p.updated_at
+            ORDER BY s.title COLLATE NOCASE, c.position, c.id
+        """, (section, teacher_id)).fetchall()
+    chapters = []
+    total_topics = covered_topics = 0
+    for row in rows:
+        item = dict(row)
+        item["topic_count"] = int(item["topic_count"])
+        if item["completed"]:
+            item["status"] = "Completed"
+            item["covered_topics"] = item["topic_count"]
+        elif item["last_topic_id"]:
+            topics = get_syllabus_chapter_topics(item["syllabus_id"], item["chapter_id"], teacher_id)
+            ordered = _ordered_topic_ids(topics)
+            item["covered_topics"] = ordered.index(item["last_topic_id"]) + 1 if item["last_topic_id"] in ordered else 0
+            item["status"] = "Partially covered" if item["covered_topics"] else "Not started"
+        else:
+            item["status"] = "Not started"
+            item["covered_topics"] = 0
+        total_topics += item["topic_count"]
+        covered_topics += item["covered_topics"]
+        chapters.append(item)
+    return {
+        "section": section,
+        "chapters": chapters,
+        "total_topics": total_topics,
+        "covered_topics": covered_topics,
+        "percent_complete": (100.0 * covered_topics / total_topics) if total_topics else None,
+    }
+
+
+def _ordered_topic_ids(topics):
+    children = {}
+    for topic in topics:
+        children.setdefault(topic["parent_topic_id"], []).append(topic)
+    ordered = []
+
+    def visit(parent_id):
+        for topic in sorted(children.get(parent_id, []), key=lambda item: (item["position"], item["id"])):
+            ordered.append(topic["id"])
+            visit(topic["id"])
+
+    visit(None)
+    return ordered
+
+
+def get_progress_class_candidates(teacher_id, section, syllabus_id):
+    """Find confirmed, syllabus-linked sessions suitable for a progress date."""
+    teacher_id = _lesson_teacher_id(teacher_id)
+    if section not in {"A", "B"}:
+        raise ValueError("Section must be A or B.")
+    with connect() as conn:
+        rows = conn.execute("""
+            SELECT DISTINCT c.id, c.class_date, c.course, c.day, c.start, c.end
+            FROM confirmations c
+            JOIN class_syllabuses cs ON cs.confirmation_id = c.id
+            JOIN syllabuses s ON s.id = cs.syllabus_id AND s.teacher_id = cs.teacher_id
+            WHERE cs.teacher_id = ? AND s.id = ?
+              AND instr(',' || c.sections || ',', ',' || ? || ',') > 0
+              AND NOT EXISTS (
+                  SELECT 1 FROM makeup_obligations m
+                  WHERE m.session_id = c.session_id AND m.original_date = c.class_date
+              )
+            ORDER BY c.class_date DESC, c.start, c.id
+        """, (teacher_id, int(syllabus_id), section)).fetchall()
+    return [dict(row) for row in rows]
+
+
+def record_section_chapter_progress(teacher_id, section, syllabus_id, chapter_id,
+                                    teaching_date, recorded_at, topic_id=None,
+                                    completed=False, confirmation_id=None):
+    """Record monotonic chapter progress and its read-only history atomically."""
+    teacher_id = _lesson_teacher_id(teacher_id)
+    if section not in {"A", "B"}:
+        raise ValueError("Section must be A or B.")
+    with connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        chapter = conn.execute("""
+            SELECT c.id FROM syllabus_chapters c JOIN syllabuses s ON s.id = c.syllabus_id
+            WHERE c.id = ? AND s.id = ? AND s.teacher_id = ?
+        """, (int(chapter_id), int(syllabus_id), teacher_id)).fetchone()
+        if not chapter:
+            raise ValueError("That chapter is not available in this teacher's catalogue.")
+        topic_rows = conn.execute("""
+            SELECT t.id, t.parent_topic_id, t.position
+            FROM syllabus_topics t WHERE t.chapter_id = ?
+        """, (int(chapter_id),)).fetchall()
+        topics = [dict(row) for row in topic_rows]
+        ordered = _ordered_topic_ids(topics)
+        if completed:
+            target_topic = ordered[-1] if ordered else None
+        else:
+            if topic_id is None or int(topic_id) not in ordered:
+                raise ValueError("Choose a topic from this chapter.")
+            target_topic = int(topic_id)
+        if confirmation_id is not None:
+            linked = conn.execute("""
+                SELECT 1 FROM class_syllabuses cs JOIN confirmations c ON c.id = cs.confirmation_id
+                WHERE cs.confirmation_id = ? AND cs.syllabus_id = ? AND cs.teacher_id = ?
+                  AND instr(',' || c.sections || ',', ',' || ? || ',') > 0
+            """, (int(confirmation_id), int(syllabus_id), teacher_id, section)).fetchone()
+            if not linked:
+                raise ValueError("That class session does not match this course and section.")
+        current = conn.execute("""
+            SELECT last_topic_id, completed FROM section_chapter_progress
+            WHERE teacher_id = ? AND section = ? AND chapter_id = ?
+        """, (teacher_id, section, int(chapter_id))).fetchone()
+        if current and current["completed"]:
+            return {"saved": False, "reason": "completed"}
+        current_index = ordered.index(current["last_topic_id"]) if current and current["last_topic_id"] in ordered else -1
+        target_index = ordered.index(target_topic) if target_topic in ordered else -1
+        if current and target_index <= current_index and not completed:
+            return {"saved": False, "reason": "not_forward"}
+        conn.execute("""
+            INSERT INTO section_chapter_progress
+                (teacher_id, section, syllabus_id, chapter_id, last_topic_id, completed,
+                 teaching_date, confirmation_id, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(teacher_id, section, chapter_id) DO UPDATE SET
+                last_topic_id = excluded.last_topic_id,
+                completed = excluded.completed,
+                teaching_date = excluded.teaching_date,
+                confirmation_id = excluded.confirmation_id,
+                updated_at = excluded.updated_at
+        """, (teacher_id, section, int(syllabus_id), int(chapter_id), target_topic,
+              int(bool(completed)), teaching_date, confirmation_id, recorded_at))
+        conn.execute("""
+            INSERT OR IGNORE INTO teaching_progress_history
+                (teacher_id, section, syllabus_id, chapter_id, topic_id, completed,
+                 teaching_date, confirmation_id, recorded_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (teacher_id, section, int(syllabus_id), int(chapter_id), target_topic,
+              int(bool(completed)), teaching_date, confirmation_id, recorded_at))
+    return {"saved": True, "topic_id": target_topic, "completed": bool(completed)}
+
+
+def get_teaching_progress_history(teacher_id, section, limit=30, offset=0):
+    teacher_id = _lesson_teacher_id(teacher_id)
+    if section not in {"A", "B"}:
+        raise ValueError("Section must be A or B.")
+    limit, offset = min(50, max(1, int(limit))), max(0, int(offset))
+    with connect() as conn:
+        rows = conn.execute("""
+            SELECT h.id, h.teaching_date, h.section, h.completed, h.recorded_at,
+                   h.confirmation_id, s.title AS syllabus_title, c.title AS chapter_title,
+                   t.title AS topic_title, cls.course AS class_course,
+                   cls.start AS class_start, cls.end AS class_end
+            FROM teaching_progress_history h
+            JOIN syllabuses s ON s.id = h.syllabus_id AND s.teacher_id = h.teacher_id
+            JOIN syllabus_chapters c ON c.id = h.chapter_id AND c.syllabus_id = s.id
+            LEFT JOIN syllabus_topics t ON t.id = h.topic_id
+            LEFT JOIN confirmations cls ON cls.id = h.confirmation_id
+            WHERE h.teacher_id = ? AND h.section = ?
+            ORDER BY h.teaching_date DESC, h.id DESC LIMIT ? OFFSET ?
+        """, (teacher_id, section, limit, offset)).fetchall()
+    return [dict(row) for row in rows]
+
+
+def record_section_chapters_completed(teacher_id, section, syllabus_id, chapter_ids,
+                                      teaching_date, recorded_at, confirmation_id=None):
+    """Mark several owned chapters complete as one transaction."""
+    teacher_id = _lesson_teacher_id(teacher_id)
+    if section not in {"A", "B"}:
+        raise ValueError("Section must be A or B.")
+    ids = list(dict.fromkeys(int(value) for value in chapter_ids))
+    if not ids:
+        raise ValueError("Select at least one chapter.")
+    saved = []
+    with connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        for chapter_id in ids:
+            chapter = conn.execute("""
+                SELECT c.id FROM syllabus_chapters c JOIN syllabuses s ON s.id = c.syllabus_id
+                WHERE c.id = ? AND s.id = ? AND s.teacher_id = ?
+            """, (chapter_id, int(syllabus_id), teacher_id)).fetchone()
+            if not chapter:
+                raise ValueError("One selected chapter is no longer available in this catalogue.")
+            if confirmation_id is not None:
+                linked = conn.execute("""
+                    SELECT 1 FROM class_syllabuses cs JOIN confirmations c ON c.id = cs.confirmation_id
+                    WHERE cs.confirmation_id = ? AND cs.syllabus_id = ? AND cs.teacher_id = ?
+                      AND instr(',' || c.sections || ',', ',' || ? || ',') > 0
+                """, (int(confirmation_id), int(syllabus_id), teacher_id, section)).fetchone()
+                if not linked:
+                    raise ValueError("That class session does not match this course and section.")
+            current = conn.execute("""
+                SELECT completed FROM section_chapter_progress
+                WHERE teacher_id = ? AND section = ? AND chapter_id = ?
+            """, (teacher_id, section, chapter_id)).fetchone()
+            if current and current["completed"]:
+                continue
+            topic_rows = conn.execute(
+                "SELECT id, parent_topic_id, position FROM syllabus_topics WHERE chapter_id = ?",
+                (chapter_id,),
+            ).fetchall()
+            topic_id = _ordered_topic_ids([dict(row) for row in topic_rows])
+            last_topic_id = topic_id[-1] if topic_id else None
+            conn.execute("""
+                INSERT INTO section_chapter_progress
+                    (teacher_id, section, syllabus_id, chapter_id, last_topic_id, completed,
+                     teaching_date, confirmation_id, updated_at)
+                VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?)
+                ON CONFLICT(teacher_id, section, chapter_id) DO UPDATE SET
+                    last_topic_id = excluded.last_topic_id, completed = 1,
+                    teaching_date = excluded.teaching_date,
+                    confirmation_id = excluded.confirmation_id, updated_at = excluded.updated_at
+            """, (teacher_id, section, int(syllabus_id), chapter_id, last_topic_id,
+                  teaching_date, confirmation_id, recorded_at))
+            conn.execute("""
+                INSERT OR IGNORE INTO teaching_progress_history
+                    (teacher_id, section, syllabus_id, chapter_id, topic_id, completed,
+                     teaching_date, confirmation_id, recorded_at)
+                VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?)
+            """, (teacher_id, section, int(syllabus_id), chapter_id, last_topic_id,
+                  teaching_date, confirmation_id, recorded_at))
+            saved.append(chapter_id)
+    return saved
+
+
+DEFAULT_TEACHER_CHAPTERS = tuple(f"Chapter {number}" for number in range(1, 11))
 
 
 def ensure_default_teacher_chapters(teacher_id, created_at):
-    """Create the five starter chapters once, atomically, for a teacher."""
+    """Ensure ten starter chapters exist without changing a teacher's own chapters."""
     teacher_id = _lesson_teacher_id(teacher_id)
     with connect() as conn:
         conn.execute("BEGIN IMMEDIATE")
-        existing = conn.execute(
-            "SELECT COUNT(*) FROM teacher_chapters WHERE teacher_id = ?", (teacher_id,)
+        existing = {row["name"].casefold() for row in conn.execute(
+            "SELECT name FROM teacher_chapters WHERE teacher_id = ?", (teacher_id,)
+        )}
+        position = conn.execute(
+            "SELECT COALESCE(MAX(position), -1) + 1 FROM teacher_chapters WHERE teacher_id = ?",
+            (teacher_id,),
         ).fetchone()[0]
-        if existing == 0:
-            conn.executemany(
-                "INSERT INTO teacher_chapters (teacher_id, name, position, created_at) VALUES (?, ?, ?, ?)",
-                [(teacher_id, name, position, created_at)
-                 for position, name in enumerate(DEFAULT_TEACHER_CHAPTERS)],
-            )
+        missing = [name for name in DEFAULT_TEACHER_CHAPTERS if name.casefold() not in existing]
+        conn.executemany(
+            "INSERT INTO teacher_chapters (teacher_id, name, position, created_at) VALUES (?, ?, ?, ?)",
+            [(teacher_id, name, position + index, created_at) for index, name in enumerate(missing)],
+        )
     return list_teacher_chapters(teacher_id, limit=5, offset=0)
 
 

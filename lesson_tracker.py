@@ -310,7 +310,7 @@ def _lesson_classes_view(teacher_id, timezone, page):
     if nav:
         rows.append(nav)
     rows.extend([
-        [InlineKeyboardButton("📚 Courses & Lessons", callback_data="lesson:library:0")],
+        [InlineKeyboardButton("📚 My Catalogue", callback_data="lesson:library:0")],
         [InlineKeyboardButton("🏠 Main Menu", callback_data="makeup:home")],
     ])
     return "\n".join(lines), InlineKeyboardMarkup(rows)
@@ -486,7 +486,7 @@ def _topic_selector(confirmation_id, syllabus_id, teacher_id, chapter_page, expa
         buttons.append(nav_chapters)
     buttons.extend([
         [InlineKeyboardButton("📋 Teaching Progress", callback_data=f"lesson:progressclass:{confirmation_id}:0")],
-        [InlineKeyboardButton("📊 Course Progress", callback_data=f"lesson:progress:{syllabus_id}")],
+        [InlineKeyboardButton("📈 Track Progress", callback_data="track:start")],
         [InlineKeyboardButton("⬅️ Back to Class", callback_data=f"lesson:class:{confirmation_id}")],
     ])
     return "\n".join(lines), InlineKeyboardMarkup(buttons)
@@ -539,8 +539,8 @@ def _syllabus_library(teacher_id, page):
     start = page * CLASS_PAGE_SIZE
     visible = items[start:start + CLASS_PAGE_SIZE]
     lines = [
-        "📚 Courses & Lessons",
-        "Open a course to manage chapters, files, topics, and progress.",
+        "📚 My Catalogue",
+        "Open a course to manage its chapters, teaching files, and topics.",
         "Send a complete syllabus document to import it, or create a course and add chapters one at a time.",
         "",
     ]
@@ -561,7 +561,6 @@ def _syllabus_library(teacher_id, page):
         rows.append(nav)
     rows.extend([
         [InlineKeyboardButton("➕ Create a Course", callback_data="lesson:newcourse")],
-        [InlineKeyboardButton("🗓️ Upcoming & Recent Lessons", callback_data="lesson:classes:0")],
         [InlineKeyboardButton("📂 Existing Chapter Files", callback_data="chapter:list:0")],
         [InlineKeyboardButton("🏠 Main Menu", callback_data="makeup:home")],
     ])
@@ -588,8 +587,6 @@ def _course_view(syllabus_id, teacher_id):
         )])
     rows.extend([
         [InlineKeyboardButton("➕ Add Chapter", callback_data=f"lesson:addchapter:{syllabus_id}")],
-        [InlineKeyboardButton("📊 Course Progress", callback_data=f"lesson:progress:{syllabus_id}")],
-        [InlineKeyboardButton("🗓️ Lessons", callback_data="lesson:classes:0")],
         [InlineKeyboardButton("⬅️ All Courses", callback_data="lesson:library:0")],
     ])
     return "\n".join(lines), InlineKeyboardMarkup(rows)
@@ -612,6 +609,7 @@ def _course_chapter_view(syllabus_id, chapter_id, teacher_id):
         rows.extend([
             [InlineKeyboardButton("📥 Send Material", callback_data=f"lesson:sendmaterial:{syllabus_id}:{chapter_id}")],
             [InlineKeyboardButton("♻️ Replace Material", callback_data=f"lesson:uploadmaterial:{syllabus_id}:{chapter_id}")],
+            [InlineKeyboardButton("🗑️ Remove Material", callback_data=f"lesson:removematerial:{syllabus_id}:{chapter_id}")],
         ])
     else:
         text = f"📘 {syllabus['title']}\n📖 {chapter['title']}\n\n📎 No material attached yet.\n\n"
@@ -630,6 +628,180 @@ def _course_chapter_view(syllabus_id, chapter_id, teacher_id):
         [InlineKeyboardButton("🏠 Main Menu", callback_data="makeup:home")],
     ])
     return text, InlineKeyboardMarkup(rows)
+
+
+def _track_section_view(teacher_id, section):
+    report = database.get_section_chapter_progress(teacher_id, section)
+    lines = [f"📈 Track Progress · Section {section}", ""]
+    rows = []
+    if not report["chapters"]:
+        lines.append("No course chapters are in My Catalogue yet. Add a course and chapters first.")
+    for item in report["chapters"]:
+        if item["topic_count"]:
+            detail = f"{item['covered_topics']}/{item['topic_count']} topics"
+            if item["status"] == "Not started":
+                detail = "Not started"
+        else:
+            detail = "No confirmed topic list"
+        icon = {"Completed": "✅", "Partially covered": "🟡", "Not started": "⬜"}[item["status"]]
+        lines.append(f"{icon} {item['syllabus_title']} · {item['chapter_title']} — {detail}")
+    if report["percent_complete"] is None:
+        lines.extend(["", "📊 Overall topic coverage is unavailable until chapters have confirmed topics."])
+    else:
+        lines.extend(["", f"📊 Overall topic coverage: {report['covered_topics']}/{report['total_topics']} ({report['percent_complete']:.1f}%)"])
+    rows.extend([
+        [InlineKeyboardButton("✍️ Update Progress", callback_data=f"track:update:{section}")],
+        [InlineKeyboardButton("🕘 Teaching History", callback_data=f"track:history:{section}:0")],
+        [InlineKeyboardButton("🔁 Change Section", callback_data="track:start")],
+        [InlineKeyboardButton("🏠 Main Menu", callback_data="makeup:home")],
+    ])
+    return "\n".join(lines), InlineKeyboardMarkup(rows)
+
+
+def _track_courses_view(teacher_id, section):
+    courses = database.list_syllabuses(teacher_id)
+    rows = [[InlineKeyboardButton(
+        f"📘 {_short(item['title'], 48)}",
+        callback_data=f"track:course:{section}:{item['id']}"
+    )] for item in courses]
+    if not courses:
+        message = "📈 Track Progress\n\nThere are no courses in My Catalogue yet. Add a course first."
+    else:
+        message = f"📈 Update Section {section}\nChoose the course whose chapters you taught."
+    rows.extend([
+        [InlineKeyboardButton("⬅️ Back to Progress", callback_data=f"track:section:{section}")],
+        [InlineKeyboardButton("🏠 Main Menu", callback_data="makeup:home")],
+    ])
+    return message, InlineKeyboardMarkup(rows)
+
+
+def _track_course_view(teacher_id, section, syllabus_id, selected=None):
+    syllabus = database.get_syllabus(syllabus_id, teacher_id)
+    if not syllabus:
+        return "⚠️ That course is not available in My Catalogue.", InlineKeyboardMarkup([
+            [InlineKeyboardButton("⬅️ Back", callback_data=f"track:update:{section}")],
+        ])
+    report = database.get_section_chapter_progress(teacher_id, section)
+    progress = {item["chapter_id"]: item for item in report["chapters"]
+                if item["syllabus_id"] == int(syllabus_id)}
+    chapters = database.get_syllabus_chapters(syllabus_id, teacher_id)
+    selecting = selected is not None
+    selected = set(selected or [])
+    lines = [f"📘 {syllabus['title']} · Section {section}", "Choose a chapter to update, or select several to complete:", ""]
+    rows = []
+    for chapter in chapters:
+        item = progress.get(chapter["id"], {})
+        state = {"Completed": "✅", "Partially covered": "🟡", "Not started": "⬜"}.get(item.get("status"), "⬜")
+        marked = "☑️ " if chapter["id"] in selected else ""
+        lines.append(f"{state} {chapter['title']}")
+        rows.append([InlineKeyboardButton(
+            f"{marked}{state} {_short(chapter['title'], 42)}",
+            callback_data=(f"track:complete-toggle:{section}:{syllabus_id}:{chapter['id']}"
+                           if selecting else f"track:chapter:{section}:{syllabus_id}:{chapter['id']}")
+        )])
+    if selecting:
+        rows.append([InlineKeyboardButton(
+            "✅ Save Selected as Completed" if selected else "☑️ Select one or more chapters",
+            callback_data=f"track:complete-save:{section}:{syllabus_id}"
+        )])
+        rows.append([InlineKeyboardButton("↩️ Cancel Selection", callback_data=f"track:complete-clear:{section}:{syllabus_id}")])
+    else:
+        rows.append([InlineKeyboardButton(
+            "✅ Complete Multiple Chapters", callback_data=f"track:complete-select:{section}:{syllabus_id}"
+        )])
+    rows.extend([
+        [InlineKeyboardButton("⬅️ Courses", callback_data=f"track:update:{section}")],
+        [InlineKeyboardButton("📊 Section Overview", callback_data=f"track:section:{section}")],
+    ])
+    return "\n".join(lines), InlineKeyboardMarkup(rows)
+
+
+def _track_chapter_view(teacher_id, section, syllabus_id, chapter_id):
+    syllabus = database.get_syllabus(syllabus_id, teacher_id)
+    chapter = next((item for item in database.get_syllabus_chapters(syllabus_id, teacher_id)
+                    if item["id"] == int(chapter_id)), None)
+    if not syllabus or not chapter:
+        return "⚠️ That chapter could not be found.", InlineKeyboardMarkup([
+            [InlineKeyboardButton("⬅️ Back to Course", callback_data=f"track:course:{section}:{syllabus_id}")],
+        ])
+    progress = next((item for item in database.get_section_chapter_progress(teacher_id, section)["chapters"]
+                     if item["chapter_id"] == int(chapter_id)), None)
+    status = progress["status"] if progress else "Not started"
+    covered = progress["covered_topics"] if progress else 0
+    topics = database.get_syllabus_chapter_topics(syllabus_id, chapter_id, teacher_id)
+    flattened = _flatten_topics(_topic_tree(topics))
+    suffix = f"Up to {covered}/{len(flattened)} topic(s)" if status == "Partially covered" else status
+    rows = []
+    if status != "Completed":
+        rows.append([InlineKeyboardButton("✅ Mark Chapter Completed", callback_data=f"track:complete-one:{section}:{syllabus_id}:{chapter_id}")])
+        if flattened:
+            rows.append([InlineKeyboardButton("➡️ Choose Last Topic Covered", callback_data=f"track:topics:{section}:{syllabus_id}:{chapter_id}:0")])
+    else:
+        rows.append([InlineKeyboardButton("✅ Chapter Completed", callback_data="track:noop")])
+    rows.extend([
+        [InlineKeyboardButton("⬅️ Back to Course", callback_data=f"track:course:{section}:{syllabus_id}")],
+        [InlineKeyboardButton("📊 Section Overview", callback_data=f"track:section:{section}")],
+    ])
+    return (f"📖 {chapter['title']} · Section {section}\nCurrent progress: {suffix}\n\n"
+            f"Confirmed topics: {len(flattened)}"), InlineKeyboardMarkup(rows)
+
+
+def _track_topic_view(teacher_id, section, syllabus_id, chapter_id, page):
+    syllabus = database.get_syllabus(syllabus_id, teacher_id)
+    chapter = next((item for item in database.get_syllabus_chapters(syllabus_id, teacher_id)
+                    if item["id"] == int(chapter_id)), None)
+    if not syllabus or not chapter:
+        return "⚠️ That chapter could not be found.", InlineKeyboardMarkup([
+            [InlineKeyboardButton("⬅️ Back", callback_data=f"track:course:{section}:{syllabus_id}")],
+        ])
+    topics = _flatten_topics(_topic_tree(database.get_syllabus_chapter_topics(syllabus_id, chapter_id, teacher_id)))
+    page_size = 8
+    pages = max(1, (len(topics) + page_size - 1) // page_size)
+    page = min(max(0, int(page)), pages - 1)
+    visible = topics[page * page_size:(page + 1) * page_size]
+    lines = [f"➡️ {chapter['title']} · Section {section}", "Choose the last topic covered. Earlier topics count as covered too.", ""]
+    rows = []
+    for index, (node, depth) in enumerate(visible, start=page * page_size + 1):
+        title = "　" * depth + node["title"]
+        lines.append(f"{index}. {title}")
+        rows.append([InlineKeyboardButton(
+            f"{index}. {_short(title, 42)}",
+            callback_data=f"track:record:{section}:{syllabus_id}:{chapter_id}:{node['id']}"
+        )])
+    if not topics:
+        lines.append("No confirmed topics are available. You can still mark the whole chapter completed.")
+    nav = []
+    if page:
+        nav.append(InlineKeyboardButton("⬅️ Previous", callback_data=f"track:topics:{section}:{syllabus_id}:{chapter_id}:{page - 1}"))
+    if page + 1 < pages:
+        nav.append(InlineKeyboardButton("Next ➡️", callback_data=f"track:topics:{section}:{syllabus_id}:{chapter_id}:{page + 1}"))
+    if nav:
+        rows.append(nav)
+    rows.append([InlineKeyboardButton("⬅️ Back to Chapter", callback_data=f"track:chapter:{section}:{syllabus_id}:{chapter_id}")])
+    return "\n".join(lines), InlineKeyboardMarkup(rows)
+
+
+def _track_history_view(teacher_id, section, page):
+    page = max(0, int(page))
+    items = database.get_teaching_progress_history(teacher_id, section, limit=8, offset=page * 8)
+    lines = [f"🕘 Teaching History · Section {section}", "Read-only record of progress updates.", ""]
+    rows = []
+    if not items:
+        lines.append("No teaching progress has been recorded for this section yet.")
+    for item in items:
+        result = "✅ Completed" if item["completed"] else f"➡️ Up to {item['topic_title'] or 'saved topic'}"
+        session = (f" · {item['class_course']} {item['class_start']}–{item['class_end']}"
+                   if item["class_course"] else "")
+        lines.append(f"📅 {item['teaching_date']} · {item['syllabus_title']} · {item['chapter_title']}\n   {result}{session}")
+    if len(items) == 8:
+        rows.append([InlineKeyboardButton("More ➡️", callback_data=f"track:history:{section}:{page + 1}")])
+    if page:
+        rows.append([InlineKeyboardButton("⬅️ Newer", callback_data=f"track:history:{section}:{page - 1}")])
+    rows.extend([
+        [InlineKeyboardButton("📊 Progress Overview", callback_data=f"track:section:{section}")],
+        [InlineKeyboardButton("🏠 Main Menu", callback_data="makeup:home")],
+    ])
+    return "\n".join(lines), InlineKeyboardMarkup(rows)
 
 
 def _legacy_materials_view(syllabus_id, chapter_id, teacher_id, page):
@@ -763,10 +935,174 @@ async def handle_text_input(update, context, teacher_id, timezone):
 async def handle_callback(query, context, teacher_id, timezone):
     """Handle syllabus/lesson callbacks. Returns False for other bot features."""
     data = query.data or ""
-    if not (data.startswith("syllabus:") or data.startswith("lesson:")):
+    if not (data.startswith("syllabus:") or data.startswith("lesson:") or data.startswith("track:")):
         return False
     if query.from_user.id != teacher_id:
         await query.edit_message_text("🔒 Teacher access only.")
+        return True
+
+    if data.startswith("track:"):
+        parts = data.split(":")
+        action = parts[1]
+        if action == "noop":
+            return True
+        if action == "start":
+            context.user_data.pop("track_selected_chapters", None)
+            await query.edit_message_text(
+                "📈 Track Progress\nChoose the section whose teaching progress you want to view:\n\nSection A\nSection B",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🅰️ Section A", callback_data="track:section:A")],
+                    [InlineKeyboardButton("🅱️ Section B", callback_data="track:section:B")],
+                    [InlineKeyboardButton("🗓️ Upcoming & Recent Lessons", callback_data="lesson:classes:0")],
+                    [InlineKeyboardButton("📚 My Catalogue", callback_data="lesson:library:0")],
+                    [InlineKeyboardButton("🏠 Main Menu", callback_data="makeup:home")],
+                ]),
+            )
+            return True
+        if action == "section":
+            text, markup = _track_section_view(teacher_id, parts[2])
+            await query.edit_message_text(text, reply_markup=markup)
+            return True
+        if action == "update":
+            text, markup = _track_courses_view(teacher_id, parts[2])
+            await query.edit_message_text(text, reply_markup=markup)
+            return True
+        if action == "course":
+            section, syllabus_id = parts[2], int(parts[3])
+            state = context.user_data.get("track_selected_chapters")
+            selected = state.get("chapter_ids", []) if state and state.get("section") == section and state.get("syllabus_id") == syllabus_id else None
+            text, markup = _track_course_view(teacher_id, section, syllabus_id, selected)
+            await query.edit_message_text(text, reply_markup=markup)
+            return True
+        if action == "chapter":
+            section, syllabus_id, chapter_id = parts[2], int(parts[3]), int(parts[4])
+            text, markup = _track_chapter_view(teacher_id, section, syllabus_id, chapter_id)
+            await query.edit_message_text(text, reply_markup=markup)
+            return True
+        if action == "topics":
+            section, syllabus_id, chapter_id, page = parts[2], int(parts[3]), int(parts[4]), int(parts[5])
+            text, markup = _track_topic_view(teacher_id, section, syllabus_id, chapter_id, page)
+            await query.edit_message_text(text, reply_markup=markup)
+            return True
+        if action == "complete-select":
+            section, syllabus_id = parts[2], int(parts[3])
+            context.user_data["track_selected_chapters"] = {
+                "section": section, "syllabus_id": syllabus_id, "chapter_ids": [],
+            }
+            text, markup = _track_course_view(teacher_id, section, syllabus_id, [])
+            await query.edit_message_text(text, reply_markup=markup)
+            return True
+        if action == "complete-toggle":
+            section, syllabus_id, chapter_id = parts[2], int(parts[3]), int(parts[4])
+            state = context.user_data.get("track_selected_chapters")
+            if not state or state["section"] != section or state["syllabus_id"] != syllabus_id:
+                state = {"section": section, "syllabus_id": syllabus_id, "chapter_ids": []}
+                context.user_data["track_selected_chapters"] = state
+            selected = set(state["chapter_ids"])
+            if chapter_id in selected:
+                selected.remove(chapter_id)
+            else:
+                selected.add(chapter_id)
+            state["chapter_ids"] = sorted(selected)
+            text, markup = _track_course_view(teacher_id, section, syllabus_id, state["chapter_ids"])
+            await query.edit_message_text(text, reply_markup=markup)
+            return True
+        if action == "complete-clear":
+            context.user_data.pop("track_selected_chapters", None)
+            section, syllabus_id = parts[2], int(parts[3])
+            text, markup = _track_course_view(teacher_id, section, syllabus_id)
+            await query.edit_message_text(text, reply_markup=markup)
+            return True
+        if action in {"complete-one", "record"}:
+            if action == "complete-one":
+                section, syllabus_id, chapter_id, target = parts[2], int(parts[3]), int(parts[4]), "done"
+            else:
+                section, syllabus_id, chapter_id, target = parts[2], int(parts[3]), int(parts[4]), parts[5]
+            candidates = database.get_progress_class_candidates(teacher_id, section, syllabus_id)
+            if len(candidates) > 1:
+                rows = [[InlineKeyboardButton(
+                    f"📅 {item['class_date']} · {item['start']}–{item['end']}",
+                    callback_data=f"track:save:{section}:{syllabus_id}:{chapter_id}:{target}:{item['id']}"
+                )] for item in candidates[:20]]
+                rows.append([InlineKeyboardButton("🏠 Cancel", callback_data=f"track:chapter:{section}:{syllabus_id}:{chapter_id}")])
+                await query.edit_message_text("🗓️ More than one matching confirmed session exists. Choose the session date for this progress update:", reply_markup=InlineKeyboardMarkup(rows))
+                return True
+            confirmation_id = candidates[0]["id"] if candidates else 0
+            teaching_date = candidates[0]["class_date"] if candidates else datetime.now(ZoneInfo(timezone)).date().isoformat()
+            result = database.record_section_chapter_progress(
+                teacher_id, section, syllabus_id, chapter_id, teaching_date,
+                _now(timezone), topic_id=None if target == "done" else int(target),
+                completed=target == "done", confirmation_id=confirmation_id or None,
+            )
+            if not result["saved"]:
+                notice = "✅ This chapter is already completed; progress stays complete." if result["reason"] == "completed" else "ℹ️ Progress cannot move backwards. The saved progress was kept."
+            else:
+                notice = f"✅ Progress saved for Section {section} on {teaching_date}."
+            text, markup = _track_section_view(teacher_id, section)
+            await query.edit_message_text(notice + "\n\n" + text, reply_markup=markup)
+            return True
+        if action == "save":
+            section, syllabus_id, chapter_id, target, confirmation_id = parts[2], int(parts[3]), int(parts[4]), parts[5], int(parts[6])
+            candidates = {item["id"]: item for item in database.get_progress_class_candidates(teacher_id, section, syllabus_id)}
+            selected_class = candidates.get(confirmation_id)
+            if not selected_class:
+                await query.edit_message_text("⚠️ That class session is no longer available. Please choose the update again.")
+                return True
+            result = database.record_section_chapter_progress(
+                teacher_id, section, syllabus_id, chapter_id, selected_class["class_date"],
+                _now(timezone), topic_id=None if target == "done" else int(target),
+                completed=target == "done", confirmation_id=confirmation_id,
+            )
+            text, markup = _track_section_view(teacher_id, section)
+            notice = "✅ Progress saved." if result["saved"] else "ℹ️ This chapter is already complete or the selected topic would move progress backwards."
+            await query.edit_message_text(notice + "\n\n" + text, reply_markup=markup)
+            return True
+        if action == "complete-save":
+            section, syllabus_id = parts[2], int(parts[3])
+            state = context.user_data.get("track_selected_chapters")
+            if not state or not state["chapter_ids"]:
+                await query.answer("Select at least one chapter first.", show_alert=True)
+                return True
+            candidates = database.get_progress_class_candidates(teacher_id, section, syllabus_id)
+            if len(candidates) > 1:
+                rows = [[InlineKeyboardButton(
+                    f"📅 {item['class_date']} · {item['start']}–{item['end']}",
+                    callback_data=f"track:batchdate:{section}:{syllabus_id}:{item['id']}"
+                )] for item in candidates[:20]]
+                rows.append([InlineKeyboardButton("🏠 Cancel", callback_data=f"track:course:{section}:{syllabus_id}")])
+                await query.edit_message_text("🗓️ Choose the matching confirmed session for these completed chapters:", reply_markup=InlineKeyboardMarkup(rows))
+                return True
+            confirmation_id = candidates[0]["id"] if candidates else 0
+            teaching_date = candidates[0]["class_date"] if candidates else datetime.now(ZoneInfo(timezone)).date().isoformat()
+            saved = database.record_section_chapters_completed(
+                teacher_id, section, syllabus_id, state["chapter_ids"], teaching_date,
+                _now(timezone), confirmation_id=confirmation_id or None,
+            )
+            context.user_data.pop("track_selected_chapters", None)
+            text, markup = _track_section_view(teacher_id, section)
+            await query.edit_message_text(f"✅ {len(saved)} chapter(s) marked complete for {teaching_date}.\n\n" + text, reply_markup=markup)
+            return True
+        if action == "batchdate":
+            section, syllabus_id, confirmation_id = parts[2], int(parts[3]), int(parts[4])
+            state = context.user_data.get("track_selected_chapters")
+            candidates = {item["id"]: item for item in database.get_progress_class_candidates(teacher_id, section, syllabus_id)}
+            selected_class = candidates.get(confirmation_id)
+            if not state or not selected_class:
+                await query.edit_message_text("⚠️ That selection expired. Please choose the chapters again.")
+                return True
+            saved = database.record_section_chapters_completed(
+                teacher_id, section, syllabus_id, state["chapter_ids"], selected_class["class_date"],
+                _now(timezone), confirmation_id=confirmation_id,
+            )
+            context.user_data.pop("track_selected_chapters", None)
+            text, markup = _track_section_view(teacher_id, section)
+            await query.edit_message_text(f"✅ {len(saved)} chapter(s) marked complete for {selected_class['class_date']}.\n\n" + text, reply_markup=markup)
+            return True
+        if action == "history":
+            text, markup = _track_history_view(teacher_id, parts[2], int(parts[3]))
+            await query.edit_message_text(text, reply_markup=markup)
+            return True
+        await query.edit_message_text("⚠️ That progress action is no longer available.")
         return True
 
     if data.startswith("syllabus:"):
@@ -840,7 +1176,7 @@ async def handle_callback(query, context, teacher_id, timezone):
                 "Use the Lesson Tracker to select what you plan to teach for each class.",
                 reply_markup=InlineKeyboardMarkup([
                     [InlineKeyboardButton("📖 Open Lesson Tracker", callback_data="lesson:classes:0")],
-                    [InlineKeyboardButton("📊 Syllabus Progress", callback_data=f"lesson:progress:{saved['id']}")],
+                    [InlineKeyboardButton("📈 Track Progress", callback_data="track:start")],
                     [InlineKeyboardButton("🏠 Main Menu", callback_data="makeup:home")],
                 ]),
             )
@@ -1103,6 +1439,20 @@ async def handle_callback(query, context, teacher_id, timezone):
         text, markup = _course_chapter_view(syllabus_id, chapter_id, teacher_id)
         await query.edit_message_text(text, reply_markup=markup)
         return True
+    if action == "removematerial":
+        syllabus_id, chapter_id = int(parts[2]), int(parts[3])
+        chapter = next((item for item in database.get_syllabus_chapters(syllabus_id, teacher_id)
+                        if item["id"] == chapter_id), None)
+        if not chapter or not chapter["material_file_id"]:
+            await query.edit_message_text("⚠️ This chapter has no attached material.")
+            return True
+        if not database.remove_syllabus_chapter_material(syllabus_id, chapter_id, teacher_id):
+            await query.edit_message_text("⚠️ The material could not be removed. Reopen the chapter and try again.")
+            return True
+        text, markup = _course_chapter_view(syllabus_id, chapter_id, teacher_id)
+        await query.edit_message_text("✅ Material removed. Chapter topics and progress were kept.\n\n" + text,
+                                      reply_markup=markup)
+        return True
     if action == "legacyfiles":
         syllabus_id, chapter_id, page = map(int, parts[2:5])
         text, markup = _legacy_materials_view(syllabus_id, chapter_id, teacher_id, page)
@@ -1138,7 +1488,7 @@ async def handle_callback(query, context, teacher_id, timezone):
             f"📈 Complete: {progress['percent_complete']:.1f}%\n{bar}",
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("📖 Lessons", callback_data="lesson:classes:0")],
-                [InlineKeyboardButton("📚 Courses & Lessons", callback_data="lesson:library:0")],
+                [InlineKeyboardButton("📚 My Catalogue", callback_data="lesson:library:0")],
                 [InlineKeyboardButton("🏠 Main Menu", callback_data="makeup:home")],
             ])
         )

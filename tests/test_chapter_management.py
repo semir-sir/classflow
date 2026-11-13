@@ -96,19 +96,19 @@ class ChapterManagementTests(unittest.TestCase):
         return {"chapter_id": chapter_id, "page": 0, "chat_id": chat_id,
                 "expires_at": time.time() + 60}
 
-    def test_five_defaults_are_created_once_per_teacher_and_persist(self):
+    def test_ten_defaults_are_created_once_per_teacher_and_persist(self):
         query = FakeQuery("chapter:list:0")
         context = FakeContext()
         asyncio.run(handle_chapter_callback(query, context, TEACHER, TIMEZONE))
         names = [row["name"] for row in self.chapters()]
-        self.assertEqual(names, [f"Chapter {index}" for index in range(1, 6)])
+        self.assertEqual(names, [f"Chapter {index}" for index in range(1, 11)])
         self.assertTrue(all(not row["material_attached"] for row in self.chapters()))
         asyncio.run(handle_chapter_callback(FakeQuery("chapter:list:0"), context, TEACHER, TIMEZONE))
-        self.assertEqual(len(self.chapters()), 5)
+        self.assertEqual(len(self.chapters()), 10)
         asyncio.run(handle_chapter_callback(FakeQuery("chapter:list:0", user_id=OTHER_TEACHER), context,
                                            OTHER_TEACHER, TIMEZONE))
         self.assertEqual([row["name"] for row in self.chapters(OTHER_TEACHER)], [
-            f"Chapter {index}" for index in range(1, 6)
+            f"Chapter {index}" for index in range(1, 11)
         ])
         database.init_db()
         self.assertEqual([row["name"] for row in self.chapters()], names)
@@ -122,7 +122,7 @@ class ChapterManagementTests(unittest.TestCase):
         database.add_teacher_chapter(TEACHER, "Advanced Topics", "now")
         with self.assertRaisesRegex(ValueError, "already exists"):
             database.add_teacher_chapter(TEACHER, "advanced topics", "now")
-        for number in range(6, 13):
+        for number in range(11, 18):
             database.add_teacher_chapter(TEACHER, f"Chapter {number}", "now")
         text, markup, page = _list_view(TEACHER, 0)
         self.assertEqual(page, 0)
@@ -133,7 +133,7 @@ class ChapterManagementTests(unittest.TestCase):
         self.assertEqual(page, 2)
         nav = [button.callback_data for row in next_markup.inline_keyboard for button in row]
         self.assertIn("chapter:list:1", nav)
-        self.assertNotIn("chapter:list:3", nav)
+        self.assertIn("chapter:list:3", nav)
 
     def test_chapter_add_conversation_cancel_and_save(self):
         database.ensure_default_teacher_chapters(TEACHER, "now")

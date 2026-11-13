@@ -6,4 +6,6 @@ __pycache__/
 *.py[cod]
 data/*.sqlite3
 data/*.sqlite3-*
+data/teachers/
+data/teacher_profiles.json
 tmp/syllabus_uploads/

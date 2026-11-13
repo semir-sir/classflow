@@ -1,0 +1,15 @@
+{
+  "REPLACE_WITH_TEACHER_TELEGRAM_ID": {
+    "schedule": "data/teachers/REPLACE_WITH_TEACHER_TELEGRAM_ID/timetable.json",
+    "section_group_ids": {
+      "A": "REPLACE_WITH_SECTION_A_GROUP_ID",
+      "B": "REPLACE_WITH_SECTION_B_GROUP_ID"
+    },
+    "initial_balances": {
+      "A": 64.0,
+      "B": 64.0
+    },
+    "timezone": "Africa/Addis_Ababa",
+    "student_group_chat_id": ""
+  }
+}
